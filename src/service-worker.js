@@ -150,7 +150,8 @@ const TOOLS = [
         actions: { type: "array", items: CUA_ACTION_SCHEMA, minItems: 1, maxItems: 100, description: "Actions executed sequentially using the same schema as cua_action.action." },
         stopOnError: { type: "boolean", description: "Stop at the first failed action. Defaults to true." },
         defaultDelayMs: { type: "integer", minimum: 0, maximum: 10000 },
-        screenshotAfter: { type: "boolean" }
+        screenshotAfter: { type: "boolean" },
+        saveToFile: { type: "boolean", description: "When screenshotAfter is true, upload that final PNG and return filePathAfter. Defaults to true. Unavailable to cross-extension callers." }
       },
       required: ["tabId", "actions"]
     }
@@ -1374,7 +1375,8 @@ function consoleEntryFromEvent(method, params) {
   return null;
 }
 
-async function executeTool(name, args = {}) {
+async function executeTool(name, args = {}, context = {}) {
+  const allowFileSave = context.allowFileSave !== false;
   switch (name) {
     case "tab_open": {
       let url;
@@ -1425,7 +1427,7 @@ async function executeTool(name, args = {}) {
     case "screenshot": {
       const tab = await resolveTab(args.tabId);
       const includeImage = args.includeImage !== false;
-      const saveToFile = args.saveToFile !== false;
+      const saveToFile = allowFileSave && args.saveToFile !== false;
       if (args.uid) {
         if (includeImage || saveToFile) {
           const captured = await captureUid(tab, String(args.uid), args);
@@ -1468,20 +1470,23 @@ async function executeTool(name, args = {}) {
     case "cua_action": {
       if (!Number.isInteger(args.tabId)) throw new Error("cua_action requires the tabId returned by tab_open");
       const tab = await resolveTab(args.tabId);
-      const result = await executeCuaAction(tab, args.action);
+      const action = allowFileSave ? args.action : { ...args.action, saveToFile: false };
+      const result = await executeCuaAction(tab, action);
       const { image, snapshot, ...step } = result;
       return {
         success: true,
         tabId: tab.id,
         step,
         snapshot: snapshot ? { text: snapshot } : undefined,
-        images: image ? [{ name: String(args.action?.name || "screenshot"), ...image }] : []
+        images: image ? [{ name: String(action?.name || "screenshot"), ...image }] : []
       };
     }
     case "cua_batch": {
       if (!Number.isInteger(args.tabId)) throw new Error("cua_batch requires the tabId returned by tab_open");
       const tab = await resolveTab(args.tabId);
-      const actions = Array.isArray(args.actions) ? args.actions.slice(0, MAX_BATCH_ACTIONS) : [];
+      const actions = Array.isArray(args.actions)
+        ? args.actions.slice(0, MAX_BATCH_ACTIONS).map((action) => allowFileSave ? action : { ...action, saveToFile: false })
+        : [];
       if (!actions.length) throw new Error("actions must be a non-empty array");
       if (args.actions.length > MAX_BATCH_ACTIONS) throw new Error(`actions cannot exceed ${MAX_BATCH_ACTIONS} items`);
       await ensureDebugger(tab.id);
@@ -1510,7 +1515,9 @@ async function executeTool(name, args = {}) {
         const captured = await captureTab(tab);
         await appendRecordingCheckpoint(tab.id, captured);
         images.push({ name: "after", ...captured });
-        filePathAfter = (await saveScreenshot(captured, { tabId: tab.id, name: "after" })).filePath;
+        if (allowFileSave && args.saveToFile !== false) {
+          filePathAfter = (await saveScreenshot(captured, { tabId: tab.id, name: "after" })).filePath;
+        }
       }
       return {
         success: steps.length === actions.length && steps.every((step) => step.success),
@@ -1607,7 +1614,7 @@ async function executeTool(name, args = {}) {
         const previous = await finishActiveRecording({
           recordingId: recording.id,
           ownerId,
-          saveToFile: recording.autoSaveToFile,
+          saveToFile: allowFileSave && recording.autoSaveToFile,
           finalHoldMs: 0,
           stopReason: "replaced-by-owner"
         });
@@ -1662,7 +1669,7 @@ async function executeTool(name, args = {}) {
         capturing: false,
         maxDurationMs,
         deadlineAt: Date.now() + maxDurationMs,
-        autoSaveToFile: args.saveToFile !== false,
+        autoSaveToFile: allowFileSave && args.saveToFile !== false,
         cursorMoveMs: Math.max(0, Math.min(2000, Math.floor(args.cursorMoveMs == null ? DEFAULT_CURSOR_MOVE_MS : Number(args.cursorMoveMs) || 0))),
         quality: Math.max(20, Math.min(100, Math.floor(Number(args.quality) || DEFAULT_RECORDING_QUALITY))),
         width,
@@ -1725,7 +1732,7 @@ async function executeTool(name, args = {}) {
       return finishActiveRecording({
         recordingId: args.recordingId,
         ownerId: args.ownerId,
-        saveToFile: args.saveToFile !== false,
+        saveToFile: allowFileSave && args.saveToFile !== false,
         finalHoldMs,
         stopReason: "manual"
       });
@@ -1822,7 +1829,7 @@ function resultFilePaths(result) {
   return [...new Set(paths.filter(Boolean).map(String))];
 }
 
-function sendResult(id, result) {
+function formatToolResult(result) {
   const images = result?.image ? [{ name: "screenshot", ...result.image }] : (result?.images || []);
   const snapshotText = result?.snapshot?.text || (typeof result?.snapshot === "string" ? result.snapshot : "");
   const filePaths = resultFilePaths(result);
@@ -1833,51 +1840,86 @@ function sendResult(id, result) {
       const { text: _text, ...snapshotMetadata } = result.snapshot;
       metadata.snapshot = snapshotMetadata;
     }
-    send({
-      jsonrpc: "2.0", id,
-      result: {
-        ...fileFields,
-        content: [
-          ...images.map((item) => ({ type: "image", mimeType: item.mimeType, data: item.data })),
-          ...(snapshotText ? [{ type: "text", text: snapshotText }] : []),
-          { type: "text", text: JSON.stringify({ ...metadata, screenshots: images.map((item) => item.name) }) }
-        ]
-      }
-    });
-    return;
+    return {
+      ...fileFields,
+      content: [
+        ...images.map((item) => ({ type: "image", mimeType: item.mimeType, data: item.data })),
+        ...(snapshotText ? [{ type: "text", text: snapshotText }] : []),
+        { type: "text", text: JSON.stringify({ ...metadata, screenshots: images.map((item) => item.name) }) }
+      ]
+    };
   }
-  send({ jsonrpc: "2.0", id, result: { ...fileFields, content: [{ type: "text", text: JSON.stringify(result) }] } });
+  return { ...fileFields, content: [{ type: "text", text: JSON.stringify(result) }] };
 }
 
-function sendError(id, error) {
-  send({ jsonrpc: "2.0", id, error: { code: -32603, message: error?.message || String(error) } });
+function rpcResult(id, result) {
+  return { jsonrpc: "2.0", id, result };
 }
 
-async function handleRpc(message) {
-  const { id, method, params } = message;
-  if (method === "initialize") {
-    send({
-      jsonrpc: "2.0", id,
-      result: {
-        protocolVersion: params?.protocolVersion || "2025-03-26",
-        capabilities: { tools: {} },
-        serverInfo: { name: "browsertrace", version: "0.1.0" }
+function rpcError(id, code, message) {
+  return { jsonrpc: "2.0", id: id == null ? null : id, error: { code, message } };
+}
+
+function toolsForTransport(transport) {
+  if (transport !== "external") return TOOLS;
+  const tools = structuredClone(TOOLS);
+  const markFileSavingUnavailable = (value) => {
+    if (!value || typeof value !== "object") return;
+    for (const [key, child] of Object.entries(value)) {
+      if (key === "saveToFile" && child && typeof child === "object") {
+        child.const = false;
+        child.description = "Cross-extension calls cannot upload files. Omit this field or set it to false.";
+      } else {
+        markFileSavingUnavailable(child);
       }
+    }
+  };
+  for (const tool of tools) {
+    markFileSavingUnavailable(tool.inputSchema);
+    if (["screenshot", "cua_action", "cua_batch", "recording_start", "recording_stop"].includes(tool.name)) {
+      tool.description += " Cross-extension calls return inline data where applicable and never upload files.";
+    }
+  }
+  return tools;
+}
+
+function queueToolCall(name, args, context) {
+  const run = executionQueue.then(() => executeTool(name, args, context));
+  executionQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+async function handleRpc(message, context = {}) {
+  if (!message || typeof message !== "object" || message.jsonrpc !== "2.0") {
+    return rpcError(message?.id, -32600, "Invalid Request: expected jsonrpc 2.0");
+  }
+  const { id, method, params } = message;
+  if (id == null) return null;
+  if (method === "initialize") {
+    return rpcResult(id, {
+      protocolVersion: params?.protocolVersion || "2025-03-26",
+      capabilities: { tools: {} },
+      serverInfo: { name: "browsertrace", version: chrome.runtime.getManifest().version }
     });
   } else if (method === "tools/list") {
-    send({ jsonrpc: "2.0", id, result: { tools: TOOLS } });
+    return rpcResult(id, { tools: toolsForTransport(context.transport) });
   } else if (method === "tools/call") {
-    executionQueue = executionQueue.then(async () => {
-      try {
-        sendResult(id, await executeTool(params?.name, params?.arguments || {}));
-      } catch (error) {
-        sendError(id, error);
-      }
-    });
+    if (!params?.name) return rpcError(id, -32602, "Invalid params: tools/call requires params.name");
+    try {
+      const result = await queueToolCall(params.name, params.arguments || {}, {
+        allowFileSave: context.transport !== "external",
+        transport: context.transport || "websocket",
+        senderId: context.senderId
+      });
+      return rpcResult(id, formatToolResult(result));
+    } catch (error) {
+      const message = error?.message || String(error);
+      return rpcError(id, /^Unknown tool:/.test(message) ? -32601 : -32000, message);
+    }
   } else if (method === "ping") {
-    send({ jsonrpc: "2.0", id, result: {} });
+    return rpcResult(id, { pong: true, version: chrome.runtime.getManifest().version });
   } else {
-    send({ jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } });
+    return rpcError(id, -32601, `Method not found: ${method}`);
   }
 }
 
@@ -1909,7 +1951,11 @@ async function connect() {
   socket.onmessage = (event) => {
     try {
       const message = JSON.parse(event.data);
-      if (message?.jsonrpc === "2.0" && message.id != null && message.method) void handleRpc(message);
+      if (message?.jsonrpc === "2.0" && message.id != null && message.method) {
+        void handleRpc(message, { transport: "websocket" }).then((response) => {
+          if (response) send(response);
+        });
+      }
     } catch {
       // Ignore malformed bridge messages.
     }
@@ -1938,6 +1984,14 @@ function restartConnection() {
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (message?.type === "trace-record") void saveTraceRecord(sender, message.payload);
   if (message?.type === "bridge-reconnect") restartConnection();
+});
+chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
+  void handleRpc(message, { transport: "external", senderId: sender.id }).then((response) => {
+    if (response) sendResponse(response);
+  }).catch((error) => {
+    sendResponse(rpcError(message?.id, -32000, error?.message || String(error)));
+  });
+  return true;
 });
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === "trace-bridge") {

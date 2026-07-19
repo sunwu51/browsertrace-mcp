@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "BrowserTrace MCP",
   "short_name": "BrowserTrace",
-  "description": "Expose Chrome screenshots, trusted input, and click-to-request tracing through MCP Center.",
+  "description": "Expose Chrome screenshots, trusted input, and request tracing through MCP Center or direct extension RPC.",
   "version": "0.1.0",
   "minimum_chrome_version": "116",
   "background": {
@@ -40,6 +40,10 @@
   "options_page": "options.html",
   "action": {
     "default_title": "BrowserTrace MCP settings"
+  },
+  "externally_connectable": {
+    "ids": ["*"],
+    "matches": []
   },
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'; connect-src http: https: ws: wss:"

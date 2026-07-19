@@ -18,6 +18,7 @@ test("built extension contains the required MV3 capabilities", async () => {
   assert.ok(manifest.permissions.includes("unlimitedStorage"));
   assert.ok(manifest.permissions.includes("tabGroups"));
   assert.ok(manifest.host_permissions.includes("<all_urls>"));
+  assert.deepEqual(manifest.externally_connectable, { ids: ["*"], matches: [] });
   assert.deepEqual(manifest.content_scripts[0].js, ["trace-runtime.js"]);
   await readFile(join(root, "dist", "recorder.html"), "utf8");
   await readFile(join(root, "dist", "recorder.js"), "utf8");
@@ -68,7 +69,7 @@ test("service worker exposes the debugging and trace query tools", async () => {
   assert.match(worker, /body: form/);
   assert.doesNotMatch(worker, /JSON\.stringify\(\{ data, mimeType, filename \}\)/);
   assert.match(worker, /filePath: saveToFile/);
-  assert.match(worker, /const saveToFile = args\.saveToFile !== false/);
+  assert.match(worker, /const saveToFile = allowFileSave && args\.saveToFile !== false/);
   assert.match(worker, /chrome\.tabs\.create\(\{ url: url\.href, active: args\.active === true \}\)/);
   assert.match(worker, /autoDiscardable: false/);
   assert.match(worker, /addTabToGroup\(tab, args\.groupName\)/);
@@ -128,6 +129,15 @@ test("service worker exposes the debugging and trace query tools", async () => {
   assert.match(worker, /cua_batch requires the tabId returned by tab_open/);
   assert.match(worker, /required: \["tabId", "action"\]/);
   assert.match(worker, /required: \["tabId", "actions"\]/);
+  assert.match(worker, /chrome\.runtime\.onMessageExternal\.addListener/);
+  assert.match(worker, /transport: "external"/);
+  assert.match(worker, /allowFileSave: context\.transport !== "external"/);
+  assert.match(worker, /const allowFileSave = context\.allowFileSave !== false/);
+  assert.match(worker, /const saveToFile = allowFileSave && args\.saveToFile !== false/);
+  assert.match(worker, /autoSaveToFile: allowFileSave && args\.saveToFile !== false/);
+  assert.match(worker, /saveToFile: allowFileSave && recording\.autoSaveToFile/);
+  assert.match(worker, /if \(allowFileSave && args\.saveToFile !== false\)/);
+  assert.match(worker, /child\.const = false/);
   assert.match(worker, /type === "hover"[\s\S]*durationMs/);
   assert.match(worker, /pointForAction\(tab\.id, action/);
   assert.match(worker, /const CUA_ACTION_SCHEMA = \{/);

@@ -30,6 +30,49 @@ ws://localhost:3000/ws/browsertrace
 Click the extension action to change the URL or disable the bridge. MCP Center
 exposes the tools with its normal server prefix, for example
 `browsertrace_screenshot`.
+This switch controls only the MCP Center WebSocket connection; direct calls
+from other extensions remain available.
+
+## Direct calls from another extension
+
+BrowserTrace also exposes the same JSON-RPC 2.0 MCP surface directly to other
+installed Chrome extensions. The receiving manifest uses
+`externally_connectable.ids: ["*"]` with `matches: []`, so extension callers are
+allowed but ordinary web pages are not. A caller only needs the BrowserTrace
+extension ID shown on `chrome://extensions`:
+
+```js
+const BROWSERTRACE_ID = "<browsertrace-extension-id>";
+
+chrome.runtime.sendMessage(
+  BROWSERTRACE_ID,
+  { jsonrpc: "2.0", id: 1, method: "tools/list" },
+  (response) => console.log(response.result.tools)
+);
+
+chrome.runtime.sendMessage(
+  BROWSERTRACE_ID,
+  {
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: {
+      name: "screenshot",
+      arguments: { tabId: 123, includeImage: true }
+    }
+  },
+  (response) => console.log(response)
+);
+```
+
+Both transports support `initialize`, `tools/list`, `tools/call`, and `ping`.
+Direct extension calls can receive inline MCP image content, snapshots, and
+normal JSON results, but cannot upload screenshots or recordings to MCP Center.
+`saveToFile` is forced to `false` for direct calls even if the caller supplies
+`true`; this applies to screenshots, CUA screenshot actions, batch final
+screenshots, and recording start/stop. A stopped direct-call recording therefore
+does not return a video file. Restrict `externally_connectable.ids` to known
+extension IDs if the local Chrome profile contains untrusted extensions.
 
 ## Typical agent loop
 
