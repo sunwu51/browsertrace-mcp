@@ -1,0 +1,18 @@
+{
+  "name": "browsertrace-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "node --check src/service-worker.js && node --check src/trace-runtime.js && node --check src/content-bridge.js && node --check src/options.js && node --check src/recorder.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "buffer": "^6.0.3",
+    "ts-ebml": "^3.0.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  }
+}

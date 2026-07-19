@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>BrowserTrace MCP</title>
+    <link rel="stylesheet" href="options.css">
+  </head>
+  <body>
+    <main>
+      <h1>BrowserTrace MCP</h1>
+      <label class="toggle"><input id="enabled" type="checkbox"> 启用 MCP Bridge</label>
+      <label for="wsUrl">MCP Center WebSocket URL</label>
+      <input id="wsUrl" type="url" spellcheck="false" placeholder="ws://localhost:3000/ws/browsertrace">
+      <div class="actions">
+        <button id="save" type="button">保存并重连</button>
+        <span id="status" aria-live="polite"></span>
+      </div>
+      <p>加载或更新扩展后，请刷新需要调试的页面，以便在页面代码之前安装 OPID tracer。</p>
+    </main>
+    <script src="options.js"></script>
+  </body>
+</html>

@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "BrowserTrace MCP",
+  "short_name": "BrowserTrace",
+  "description": "Expose Chrome screenshots, trusted input, and click-to-request tracing through MCP Center.",
+  "version": "0.1.0",
+  "minimum_chrome_version": "116",
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "permissions": [
+    "activeTab",
+    "alarms",
+    "debugger",
+    "offscreen",
+    "storage",
+    "tabGroups",
+    "tabs",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["trace-runtime.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content-bridge.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "options_page": "options.html",
+  "action": {
+    "default_title": "BrowserTrace MCP settings"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src http: https: ws: wss:"
+  }
+}

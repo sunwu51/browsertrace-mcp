@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>BrowserTrace MCP trace fixture</title>
+    <style>
+      body { font: 16px system-ui, sans-serif; margin: 48px; }
+      button { padding: 12px 18px; }
+      pre { margin-top: 24px; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <button id="load" type="button">Load two requests</button>
+    <pre id="output">Idle</pre>
+    <script>
+      document.querySelector("#load").addEventListener("click", async () => {
+        const output = document.querySelector("#output");
+        output.textContent = "Loading";
+        const first = await fetch("data-one.json").then((response) => response.json());
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        const second = await fetch("data-two.json").then((response) => response.json());
+        output.textContent = JSON.stringify({ first, second }, null, 2);
+      });
+    </script>
+  </body>
+</html>
