@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "check": "node --check src/service-worker.js && node --check src/trace-runtime.js && node --check src/content-bridge.js && node --check src/options.js && node --check src/recorder.js",
+    "check": "node --check src/service-worker.js && node --check src/trace-runtime.js && node --check src/content-bridge.js && node --check src/options.js",
     "test": "node --test"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@sunwu51/chrome-mcp-sdk": "^0.1.1"
+  },
   "devDependencies": {
     "esbuild": "^0.28.1"
   }

@@ -1,8 +1,9 @@
 # BrowserTrace MCP
 
 An unpacked Chrome MV3 extension that exposes screenshots, trusted mouse/keyboard
-input, and click-to-fetch/XHR tracing through the WebSocket bridge in
-[`sunwu51/mcp-center`](https://github.com/sunwu51/mcp-center).
+input, and click-to-fetch/XHR tracing through the
+[`@sunwu51/chrome-mcp-sdk`](https://www.npmjs.com/package/@sunwu51/chrome-mcp-sdk)
+WebSocket bridge for [`sunwu51/mcp-center`](https://github.com/sunwu51/mcp-center).
 
 The tracer does not add an OPID header or otherwise modify page requests. It
 records the operation context locally in `chrome.storage.local` and deletes a
@@ -31,7 +32,7 @@ Click the extension action to change the URL or disable the bridge. MCP Center
 exposes the tools with its normal server prefix, for example
 `browsertrace_screenshot`.
 This switch controls only the MCP Center WebSocket connection; direct calls
-from other extensions remain available.
+from other extensions remain enabled through the same Chrome MCP SDK tool registry.
 
 ## Direct calls from another extension
 
@@ -66,13 +67,10 @@ chrome.runtime.sendMessage(
 ```
 
 Both transports support `initialize`, `tools/list`, `tools/call`, and `ping`.
-Direct extension calls can receive inline MCP image content, snapshots, and
-normal JSON results, but cannot upload screenshots or recordings to MCP Center.
-`saveToFile` is forced to `false` for direct calls even if the caller supplies
-`true`; this applies to screenshots, CUA screenshot actions, and recording
-start/stop. A stopped direct-call recording therefore
-does not return a video file. Restrict `externally_connectable.ids` to known
-extension IDs if the local Chrome profile contains untrusted extensions.
+Direct extension calls can receive inline MCP image content, snapshots, normal
+JSON results, and upload screenshots to MCP Center. Restrict
+`externally_connectable.ids` to known extension IDs if the local Chrome profile
+contains untrusted extensions.
 
 ## Typical agent loop
 
@@ -129,7 +127,7 @@ a local file:
 The upload URL is derived from the configured WebSocket URL, for example
 `ws://localhost:3000/ws/browsertrace` becomes
 `http://localhost:3000/fs/upload`. Files are sent as binary
-`multipart/form-data` in the `file` field; videos are not converted to Base64.
+`multipart/form-data` in the `file` field.
 Set both `includeImage: false` and
 `saveToFile: false` for a semantic-only snapshot with no PNG capture. UID and
 CUA screenshot actions use the same behavior.
@@ -290,8 +288,8 @@ are deliberately omitted. It does not save browser state; pass the returned
 ```
 
 For task-scoped cleanup, supply a stable `ownerId` to every `tab_open` call,
-then call `session_finish` with the same ID. It stops that owner's recording,
-detaches the debugger, and closes every tab the task opened:
+then call `session_finish` with the same ID. It detaches the debugger and
+closes every tab the task opened:
 
 ```json
 { "ownerId": "agent-task-abc" }
@@ -300,70 +298,6 @@ detaches the debugger, and closes every tab the task opened:
 For a form field addressed by `uid`, `type` replaces the field's current value
 by default (including browser-prefilled credentials). Set `append: true` only
 when text should be appended deliberately.
-
-## Continuous WebM recording
-
-`recording_start` immediately starts continuous evidence recording for one tab.
-The page remains in the video while the agent is thinking, which preserves the
-full interaction timeline. Recording stops automatically after five minutes by
-default and uploads using the `saveToFile` choice supplied at start.
-
-```json
-{
-  "tabId": 123,
-  "ownerId": "agent-task-abc",
-  "name": "login-debug",
-  "maxDurationMs": 300000,
-  "saveToFile": true,
-  "fps": 15,
-  "quality": 90
-}
-```
-
-The recorder is intentionally singleton. `ownerId` is required and should be
-stable for one agent task. If the same owner needs to switch tabs, call
-`recording_start` with `"replaceExisting": true`; the previous recording is
-stopped and saved before the new one starts. A different owner's recording is
-never preempted and returns `reason: "recording-busy"`, including its remaining
-lease time so the caller can retry later.
-
-CDP source frames update the latest page image. While recording, the extension
-injects a pointer-events-disabled Canvas overlay into the operated page. It
-draws synthetic cursor movement, click ripples, and key labels, so these cues
-are captured directly in the continuous page recording. The output uses the viewport's
-physical pixel size (`CSS pixels * devicePixelRatio`), capped at 3840x2160 by
-default, and WebM defaults to 12 Mbps. Supply `videoBitsPerSecond` to request up
-to 20 Mbps, or lower `maxWidth` and `maxHeight` when file size matters. No video
-frames pass through MCP Center.
-
-`maxDurationMs` may be reduced but cannot exceed 300000ms. Use
-`recording_status` while recording; after an automatic stop it returns the
-uploaded file in `lastResult`. Stop and upload earlier with:
-
-```json
-{
-  "recordingId": "recording_xxx",
-  "ownerId": "agent-task-abc",
-  "saveToFile": true
-}
-```
-
-`recording_stop` waits for the current action's remaining tail window, uploads
-the WebM, and returns the absolute temporary `filePath`. Before stopping it
-captures the tab's current state and holds that final frame for 2000ms, so an
-async result verified by the agent remains visible at the end of the evidence
-video. Set `finalHoldMs: 0` to disable or choose up to 10000ms. Screenshots taken
-while recording are also inserted as 750ms video checkpoints. Set
-`saveToFile: false` to finish without uploading. Uploaded recordings are EBML
-remuxed with Duration, SeekHead, and Cues metadata so players can display the
-total duration and seek correctly. The result includes `remuxed`,
-`mediaDurationMs`, `durationMs`, `size`, and `originalSize` diagnostics.
-Both `recording_stop` and `recording_cancel` require the matching `recordingId`
-and `ownerId`; omitting either cannot stop the singleton recorder.
-`recording_cancel` discards the encoder state.
-MCP Center currently limits uploads to 500 MiB. The five-minute cap limits time,
-not exact encoded size, so unusually high-bitrate recordings can still be
-rejected with HTTP 413. Only one recording can be active at a time.
 
 ## Current scope and limitations
 

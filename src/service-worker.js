@@ -1,5 +1,7 @@
 /* global chrome */
 
+import { createChromeMcpServer, createMcpCenterFileStore } from "@sunwu51/chrome-mcp-sdk";
+
 const DEFAULT_SETTINGS = {
   wsUrl: "ws://localhost:3000/ws/browsertrace",
   enabled: true
@@ -21,18 +23,11 @@ const MAX_WORKFLOW_RUNS = 20;
 const DEFAULT_ELEMENT_WAIT_MS = 6000;
 const DEFAULT_NETWORK_IDLE_MS = 500;
 const DEBUGGER_VERSION = "1.3";
-const reconnectDelays = [1000, 2000, 5000, 10000, 30000];
-
-let socket = null;
-let reconnectTimer = null;
-let reconnectAttempt = 0;
-let running = false;
 let executionQueue = Promise.resolve();
 const writeQueues = new Map();
 const attachedTabs = new Set();
 const managedTabIds = new Set();
 const managedTabOwnerIds = new Map();
-// Kept null until remaining legacy cleanup code is removed; no recording tool can create it.
 let recording = null;
 const workflowRuns = new Map();
 
@@ -539,14 +534,6 @@ async function addTabToGroup(tab, requestedName) {
 async function closeTabs(tabIds) {
   const ids = [...new Set(tabIds.filter(Number.isInteger))];
   if (!ids.length) return [];
-  if (recording && ids.includes(recording.tabId)) {
-    if (recording.capturing) {
-      await chrome.debugger.sendCommand({ tabId: recording.tabId }, "Page.stopScreencast").catch(() => {});
-    }
-    await recorderRequest("cancel").catch(() => {});
-    await chrome.alarms.clear(RECORDING_TIMEOUT_ALARM);
-    recording = null;
-  }
   await Promise.all(ids.map(async (tabId) => {
     await chrome.debugger.detach({ tabId }).catch(() => {});
     attachedTabs.delete(tabId);
@@ -818,15 +805,6 @@ async function recordingMarkKey(tabId, text) {
   await callRecordingOverlay(tabId, "key", [String(text)]);
 }
 
-function uploadUrlFromWebSocket(wsUrl) {
-  const url = new URL(wsUrl);
-  url.protocol = url.protocol === "wss:" ? "https:" : "http:";
-  url.pathname = "/fs/upload";
-  url.search = "";
-  url.hash = "";
-  return url.href;
-}
-
 async function finishActiveRecording({ recordingId, ownerId, saveToFile = true, finalHoldMs = DEFAULT_RECORDING_FINAL_HOLD_MS, stopReason = "manual" } = {}) {
   assertRecordingOwner(recordingId, ownerId);
   if (recordingFinishing) return recordingFinishing;
@@ -884,24 +862,17 @@ async function finishActiveRecording({ recordingId, ownerId, saveToFile = true, 
   }
 }
 
-async function getUploadUrl() {
+async function getMcpCenterBaseUrl() {
   const settings = await chrome.storage.local.get(DEFAULT_SETTINGS);
-  return uploadUrlFromWebSocket(settings.wsUrl);
+  return new URL(settings.wsUrl).origin;
 }
 
 async function uploadBase64File(data, mimeType, filename) {
   const binary = atob(data);
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
-  const form = new FormData();
-  form.append("file", new Blob([bytes], { type: mimeType }), filename);
-  const response = await fetch(await getUploadUrl(), {
-    method: "POST",
-    body: form
-  });
-  if (!response.ok) throw new Error(`MCP Center upload failed: ${response.status} ${await response.text()}`);
-  const result = await response.json();
-  if (!result?.path) throw new Error("MCP Center upload response did not include path");
+  const fileStore = createMcpCenterFileStore({ baseUrl: await getMcpCenterBaseUrl() });
+  const result = await fileStore.upload({ blob: new Blob([bytes], { type: mimeType }), filename });
   return String(result.path);
 }
 
@@ -1989,10 +1960,6 @@ async function executeTool(name, args = {}, context = {}) {
   }
 }
 
-function send(payload) {
-  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
-}
-
 function resultFilePaths(result) {
   const paths = [result?.filePath, result?.filePathAfter, result?.step?.filePath];
   for (const step of result?.steps || []) paths.push(step?.filePath);
@@ -2022,132 +1989,44 @@ function formatToolResult(result) {
   return { ...fileFields, content: [{ type: "text", text: JSON.stringify(result) }] };
 }
 
-function rpcResult(id, result) {
-  return { jsonrpc: "2.0", id, result };
-}
-
-function rpcError(id, code, message) {
-  return { jsonrpc: "2.0", id: id == null ? null : id, error: { code, message } };
-}
-
-function toolsForTransport(transport) {
-  if (transport !== "external") return TOOLS;
-  const tools = structuredClone(TOOLS);
-  const markFileSavingUnavailable = (value) => {
-    if (!value || typeof value !== "object") return;
-    for (const [key, child] of Object.entries(value)) {
-      if (key === "saveToFile" && child && typeof child === "object") {
-        child.const = false;
-        child.description = "Cross-extension calls cannot upload files. Omit this field or set it to false.";
-      } else {
-        markFileSavingUnavailable(child);
-      }
-    }
-  };
-  for (const tool of tools) {
-    markFileSavingUnavailable(tool.inputSchema);
-    if (["screenshot", "cua_action", "recording_start", "recording_stop"].includes(tool.name)) {
-      tool.description += " Cross-extension calls return inline data where applicable and never upload files.";
-    }
-  }
-  return tools;
-}
-
 function queueToolCall(name, args, context) {
   const run = executionQueue.then(() => executeTool(name, args, context));
   executionQueue = run.then(() => undefined, () => undefined);
   return run;
 }
 
-async function handleRpc(message, context = {}) {
-  if (!message || typeof message !== "object" || message.jsonrpc !== "2.0") {
-    return rpcError(message?.id, -32600, "Invalid Request: expected jsonrpc 2.0");
-  }
-  const { id, method, params } = message;
-  if (id == null) return null;
-  if (method === "initialize") {
-    return rpcResult(id, {
-      protocolVersion: params?.protocolVersion || "2025-03-26",
-      capabilities: { tools: {} },
-      serverInfo: { name: "browsertrace", version: chrome.runtime.getManifest().version }
-    });
-  } else if (method === "tools/list") {
-    return rpcResult(id, { tools: toolsForTransport(context.transport) });
-  } else if (method === "tools/call") {
-    if (!params?.name) return rpcError(id, -32602, "Invalid params: tools/call requires params.name");
-    try {
-      const result = await queueToolCall(params.name, params.arguments || {}, {
-        allowFileSave: context.transport !== "external",
-        transport: context.transport || "websocket",
-        senderId: context.senderId
-      });
-      return rpcResult(id, formatToolResult(result));
-    } catch (error) {
-      const message = error?.message || String(error);
-      return rpcError(id, /^Unknown tool:/.test(message) ? -32601 : -32000, message);
+const mcp = createChromeMcpServer({
+  serverInfo: { name: "browsertrace", version: chrome.runtime.getManifest().version },
+  tools: TOOLS.map((tool) => ({
+    ...tool,
+    async handler(args) {
+      return formatToolResult(await queueToolCall(tool.name, args, { allowFileSave: true }));
     }
-  } else if (method === "ping") {
-    return rpcResult(id, { pong: true, version: chrome.runtime.getManifest().version });
-  } else {
-    return rpcError(id, -32601, `Method not found: ${method}`);
-  }
-}
-
-function scheduleReconnect() {
-  if (!running || reconnectTimer) return;
-  const delay = reconnectDelays[Math.min(reconnectAttempt++, reconnectDelays.length - 1)];
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    void connect();
-  }, delay);
-}
+  })),
+  webSocket: {
+    enabled: true,
+    url: DEFAULT_SETTINGS.wsUrl,
+    reconnect: { initialDelayMs: 1000, maxDelayMs: 30000, multiplier: 2 },
+    onStatus: (status) => void chrome.storage.local.set({
+      bridgeStatus: { connected: status.connected, url: status.url, updatedAt: Date.now() }
+    })
+  },
+  externalRpc: { enabled: true }
+});
 
 async function connect() {
   const settings = await chrome.storage.local.get(DEFAULT_SETTINGS);
-  running = settings.enabled === true;
-  if (!running || !/^wss?:\/\//.test(settings.wsUrl || "")) return;
-  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
-
-  try {
-    socket = new WebSocket(settings.wsUrl);
-  } catch {
-    scheduleReconnect();
+  if (settings.enabled !== true || !/^wss?:\/\//.test(settings.wsUrl || "")) {
+    mcp.bridge?.stop();
     return;
   }
-  socket.onopen = () => {
-    reconnectAttempt = 0;
-    void chrome.storage.local.set({ bridgeStatus: { connected: true, url: settings.wsUrl, updatedAt: Date.now() } });
-  };
-  socket.onmessage = (event) => {
-    try {
-      const message = JSON.parse(event.data);
-      if (message?.jsonrpc === "2.0" && message.id != null && message.method) {
-        void handleRpc(message, { transport: "websocket" }).then((response) => {
-          if (response) send(response);
-        });
-      }
-    } catch {
-      // Ignore malformed bridge messages.
-    }
-  };
-  socket.onclose = () => {
-    socket = null;
-    void chrome.storage.local.set({ bridgeStatus: { connected: false, url: settings.wsUrl, updatedAt: Date.now() } });
-    scheduleReconnect();
-  };
-  socket.onerror = () => socket?.close();
+  if (!mcp.bridge) return;
+  mcp.bridge.url = settings.wsUrl;
+  mcp.bridge.start();
 }
 
 function restartConnection() {
-  clearTimeout(reconnectTimer);
-  reconnectTimer = null;
-  running = false;
-  if (socket) {
-    socket.onclose = null;
-    socket.close();
-    socket = null;
-  }
-  reconnectAttempt = 0;
+  mcp.bridge?.stop();
   void connect();
 }
 
@@ -2155,14 +2034,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   if (message?.type === "trace-record") void saveTraceRecord(sender, message.payload);
   if (message?.type === "bridge-reconnect") restartConnection();
 });
-chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
-  void handleRpc(message, { transport: "external", senderId: sender.id }).then((response) => {
-    if (response) sendResponse(response);
-  }).catch((error) => {
-    sendResponse(rpcError(message?.id, -32000, error?.message || String(error)));
-  });
-  return true;
-});
+mcp.start({ webSocket: false, externalRpc: true });
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === "trace-bridge") {
     port.onMessage.addListener((message) => {
