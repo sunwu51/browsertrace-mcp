@@ -88,6 +88,7 @@ const CUA_ACTION_SCHEMA = {
     delayAfterMs: { type: "integer", minimum: 0, maximum: 10000, description: "Fixed delay after this action before it returns. Prefer an explicit state wait when available." },
     output: { type: "string", enum: ["file", "base64"], description: "For screenshot actions, choose exactly one output. file saves a PNG and returns filePath (default); base64 returns inline PNG data." },
     fullPage: { type: "boolean", description: "For screenshot actions without uid, capture the entire rendered page instead of the viewport." },
+    hideCursor: { type: "boolean", description: "For screenshot actions, hide the virtual cursor while capturing. Defaults to true." },
     verbose: { type: "boolean", description: "For snapshot actions, include low-signal accessibility nodes." },
     maxNodes: { type: "integer", minimum: 1, maximum: 2000, description: "For snapshot actions, maximum semantic snapshot nodes. Defaults to 500." },
     name: { type: "string", description: "Optional screenshot name used in CUA action results." }
@@ -186,7 +187,8 @@ const TOOLS = [
         output: { type: "string", enum: ["file", "base64"], description: "Choose exactly one image output. Defaults to file." },
         name: { type: "string", description: "Screenshot name used to preserve a meaningful .png filename extension during upload." },
         uid: { type: "string", description: "Optional UID from a previous snapshot. Captures that element instead of the viewport." },
-        fullPage: { type: "boolean", description: "Capture the entire rendered page instead of the viewport. Ignored when uid is supplied." }
+        fullPage: { type: "boolean", description: "Capture the entire rendered page instead of the viewport. Ignored when uid is supplied." },
+        hideCursor: { type: "boolean", description: "Hide the virtual cursor while capturing. Defaults to true." }
       }
     }
   },
@@ -1307,8 +1309,39 @@ async function captureTab(tab, options = {}) {
     if (!(size?.width > 0 && size?.height > 0)) throw new Error("Page has no capturable content size");
     params.clip = { x: 0, y: 0, width: size.width, height: size.height, scale: 1 };
   }
-  const result = await cdp(tab.id, "Page.captureScreenshot", params);
-  return { mimeType: "image/png", data: result.data };
+  return await captureWithoutVirtualCursor(tab.id, options, async () => {
+    const result = await cdp(tab.id, "Page.captureScreenshot", params);
+    return { mimeType: "image/png", data: result.data };
+  });
+}
+
+async function captureWithoutVirtualCursor(tabId, options, capture) {
+  if (options.hideCursor === false) return await capture();
+  const hidden = await cdp(tabId, "Runtime.evaluate", {
+    expression: `(async () => {
+      const canvas = globalThis.__chromeDebuggerRecordingOverlay?.canvas;
+      if (!canvas?.isConnected) return null;
+      const visibility = canvas.style.visibility;
+      canvas.style.visibility = "hidden";
+      await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+      return visibility;
+    })()`,
+    awaitPromise: true,
+    returnByValue: true
+  });
+  const previousVisibility = hidden?.result?.value;
+  try {
+    return await capture();
+  } finally {
+    if (typeof previousVisibility === "string") {
+      await cdp(tabId, "Runtime.evaluate", {
+        expression: `(() => {
+          const canvas = globalThis.__chromeDebuggerRecordingOverlay?.canvas;
+          if (canvas?.isConnected) canvas.style.visibility = ${JSON.stringify(previousVisibility)};
+        })()`
+      }).catch(() => {});
+    }
+  }
 }
 
 async function captureUid(tab, uid, snapshotOptions = {}) {
@@ -1319,23 +1352,25 @@ async function captureUid(tab, uid, snapshotOptions = {}) {
   const metrics = await cdp(tab.id, "Page.getLayoutMetrics");
   const pageX = Number(metrics?.cssLayoutViewport?.pageX ?? metrics?.layoutViewport?.pageX) || 0;
   const pageY = Number(metrics?.cssLayoutViewport?.pageY ?? metrics?.layoutViewport?.pageY) || 0;
-  const result = await cdp(tab.id, "Page.captureScreenshot", {
-    format: "png",
-    fromSurface: true,
-    captureBeyondViewport: true,
-    clip: {
-      x: resolved.bounds.x + pageX,
-      y: resolved.bounds.y + pageY,
-      width: resolved.bounds.width,
-      height: resolved.bounds.height,
-      scale: 1
-    }
+  return await captureWithoutVirtualCursor(tab.id, snapshotOptions, async () => {
+    const result = await cdp(tab.id, "Page.captureScreenshot", {
+      format: "png",
+      fromSurface: true,
+      captureBeyondViewport: true,
+      clip: {
+        x: resolved.bounds.x + pageX,
+        y: resolved.bounds.y + pageY,
+        width: resolved.bounds.width,
+        height: resolved.bounds.height,
+        scale: 1
+      }
+    });
+    return {
+      image: { mimeType: "image/png", data: result.data },
+      bounds: resolved.bounds,
+      snapshot: resolved.snapshot
+    };
   });
-  return {
-    image: { mimeType: "image/png", data: result.data },
-    bounds: resolved.bounds,
-    snapshot: resolved.snapshot
-  };
 }
 
 const ACTIONS_WITH_OPERATION = new Set([

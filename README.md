@@ -97,6 +97,8 @@ so its indicator is present before coordinates are measured.
 
 All screenshots use CDP `Page.captureScreenshot`; they do not activate the tab
 or focus its window. Set `fullPage: true` to capture the entire rendered page.
+The virtual cursor is hidden during capture by default. Set `hideCursor: false`
+to include it in viewport, full-page, element, or workflow screenshots.
 If a tab was manually discarded despite `autoDiscardable: false`, screenshot
 and snapshot operations restore it with a background reload first.
 

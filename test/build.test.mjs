@@ -17,5 +17,7 @@ test("built extension exposes workflow-based CUA without compatibility or record
   assert.match(worker, /do: CUA_ACTION_SCHEMA/);
   assert.match(worker, /Example search flow/);
   assert.match(worker, /output: \{ type: "string", enum: \["file", "base64"\]/);
+  assert.match(worker, /hideCursor: \{ type: "boolean"/);
+  assert.match(worker, /async function captureWithoutVirtualCursor/);
   assert.match(worker, /async function pointAtCoordinates[\s\S]*DOM\.getNodeForLocation[\s\S]*locatorForBackendNode/);
 });
