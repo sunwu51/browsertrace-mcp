@@ -14,18 +14,12 @@ const MAX_CONSOLE_ENTRIES_PER_TAB = 500;
 const MAX_NETWORK_REQUESTS_PER_TAB = 1000;
 const DEFAULT_SNAPSHOT_MAX_NODES = 500;
 const DEFAULT_TAB_GROUP_NAME = "BrowserTrace MCP";
-const DEFAULT_RECORDING_FPS = 15;
-const DEFAULT_RECORDING_QUALITY = 90;
-const DEFAULT_RECORDING_MAX_WIDTH = 3840;
-const DEFAULT_RECORDING_MAX_HEIGHT = 2160;
-const DEFAULT_RECORDING_BITRATE = 12000000;
-const DEFAULT_RECORDING_FINAL_HOLD_MS = 2000;
-const DEFAULT_RECORDING_CHECKPOINT_HOLD_MS = 750;
-const DEFAULT_RECORDING_MAX_DURATION_MS = 300000;
-const RECORDING_TIMEOUT_ALARM = "browsertrace-recording-timeout";
-const DEFAULT_CURSOR_MOVE_MS = 250;
-const MAX_BATCH_ACTIONS = 100;
 const MAX_ACTION_WAIT_MS = 10000;
+const MAX_WORKFLOW_STEPS = 200;
+const MAX_WORKFLOW_LOOP_ITERATIONS = 50;
+const MAX_WORKFLOW_RUNS = 20;
+const DEFAULT_ELEMENT_WAIT_MS = 6000;
+const DEFAULT_NETWORK_IDLE_MS = 500;
 const DEBUGGER_VERSION = "1.3";
 const reconnectDelays = [1000, 2000, 5000, 10000, 30000];
 
@@ -37,24 +31,39 @@ let executionQueue = Promise.resolve();
 const writeQueues = new Map();
 const attachedTabs = new Set();
 const managedTabIds = new Set();
-let recorderPort = null;
-let recorderPortWaiters = [];
-const recorderRequests = new Map();
+const managedTabOwnerIds = new Map();
+// Kept null until remaining legacy cleanup code is removed; no recording tool can create it.
 let recording = null;
-let recordingFrameForwarding = false;
-let recordingFinishing = null;
-let lastRecordingResult = null;
+const workflowRuns = new Map();
+
+// Content scripts are deliberately injected only after tab_open marks a tab as
+// managed. webNavigation supplies each committed frame, including iframes.
+async function injectTraceRuntime(tabId, frameId) {
+  if (!managedTabIds.has(tabId)) return;
+  await chrome.scripting.executeScript({
+    target: { tabId, frameIds: [frameId] },
+    files: ["trace-runtime.js"],
+    world: "MAIN",
+    injectImmediately: true
+  });
+  await chrome.scripting.executeScript({
+    target: { tabId, frameIds: [frameId] },
+    files: ["content-bridge.js"],
+    injectImmediately: true
+  });
+}
 
 const CUA_ACTION_SCHEMA = {
   type: "object",
-  description: "One CUA action. Use uid-based fields when a semantic snapshot UID is available; otherwise use viewport CSS pixel coordinates.",
+  description: "One CUA action. Target rules: click/double_click/right_click/move/hover/mouse_down/mouse_up need uid or locator, or x+y; drag needs fromUid+toUid or fromX+fromY+toX+toY; type requires text and optionally uid/locator to focus first (otherwise it writes to the current focus); key_press/key_down/key_up require key and optionally uid/locator to focus first; select_all/clear optionally accept uid/locator to focus first; scroll needs deltaX and/or deltaY and accepts an optional target; wait accepts durationMs; wait_for requires state and needs uid/locator for element states but not network_idle; screenshot has no required target. Prefer a snapshot UID for this document; locator is portable across navigations and is used when UID is absent or stale; coordinates are the visual fallback.",
   properties: {
     type: {
       type: "string",
-      enum: ["move", "hover", "click", "double_click", "right_click", "mouse_down", "mouse_up", "drag", "scroll", "type", "key_press", "key_down", "key_up", "select_all", "clear", "wait", "screenshot"],
+      enum: ["move", "hover", "click", "double_click", "right_click", "mouse_down", "mouse_up", "drag", "scroll", "type", "key_press", "key_down", "key_up", "select_all", "clear", "wait", "wait_for", "screenshot", "snapshot"],
       description: "Action to perform."
     },
     uid: { type: "string", description: "Target element UID from screenshot/page snapshot. Replaces x/y for mouse actions and focuses the element before text/keyboard actions." },
+    locator: { type: "object", description: "Portable target. strategies are tried in order; each is {kind:'css'|'xpath', value:string}. Exactly one visible match is required unless nth is supplied.", properties: { strategies: { type: "array", minItems: 1, items: { type: "object", properties: { kind: { type: "string", enum: ["css", "xpath"] }, value: { type: "string" } }, required: ["kind", "value"] } }, nth: { type: "integer", minimum: 0 }, fingerprint: { type: "object" } }, required: ["strategies"] },
     x: { type: "number", description: "Target viewport CSS pixel X coordinate when uid is not supplied." },
     y: { type: "number", description: "Target viewport CSS pixel Y coordinate when uid is not supplied." },
     fromUid: { type: "string", description: "Drag source UID. For drag only; replaces fromX/fromY." },
@@ -66,38 +75,97 @@ const CUA_ACTION_SCHEMA = {
     button: { type: "string", enum: ["left", "middle", "right", "back", "forward"], description: "Mouse button for mouse_down/mouse_up. Defaults to left." },
     clickCount: { type: "integer", minimum: 1, description: "Click count for mouse_down/mouse_up. Defaults to 1." },
     durationMs: { type: "integer", minimum: 0, maximum: 10000, description: "Hover hold time, wait duration, or drag duration. Hover defaults to 500ms; wait defaults to 250ms." },
+    state: { type: "string", enum: ["present", "visible", "hidden", "absent", "network_idle"], description: "For wait_for: desired element state, or network_idle." },
+    timeoutMs: { type: "integer", minimum: 100, maximum: 60000, description: "For wait_for: maximum wait time." },
+    idleMs: { type: "integer", minimum: 50, maximum: 10000, description: "For wait_for network_idle: required quiet interval; defaults to 500ms." },
     steps: { type: "integer", minimum: 2, maximum: 50, description: "Number of interpolated pointer moves for drag. Defaults to 10." },
     deltaX: { type: "number", description: "Horizontal wheel delta for scroll. Defaults to 0." },
     deltaY: { type: "number", description: "Vertical wheel delta for scroll. Positive values scroll down. Defaults to 0." },
     text: { type: "string", description: "Text inserted by the type action." },
+    append: { type: "boolean", description: "For type with uid: append instead of replacing the field's existing value. Defaults to false." },
     key: { type: "string", description: "Key or combination for keyboard actions, for example Enter, Tab, Control+A, or Control+Shift+R." },
     code: { type: "string", description: "Optional CDP physical key code, such as KeyA or ArrowDown." },
     modifiers: { type: "integer", minimum: 0, maximum: 15, description: "Optional CDP modifier bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8." },
     opid: { type: "string", description: "Operation ID to associate with resulting fetch/XHR calls. Generated automatically for input actions when omitted." },
     label: { type: "string", description: "Human-readable label stored with the generated or supplied OPID." },
     delayAfterMs: { type: "integer", minimum: 0, maximum: 10000, description: "Fixed delay after this action before it returns. Prefer an explicit state wait when available." },
-    includeImage: { type: "boolean", description: "For screenshot actions, include the PNG image. Defaults to true." },
-    saveToFile: { type: "boolean", description: "For screenshot actions, upload the PNG to MCP Center temporary storage and return its absolute filePath. Defaults to true." },
+    output: { type: "string", enum: ["file", "base64"], description: "For screenshot actions, choose exactly one output. file saves a PNG and returns filePath (default); base64 returns inline PNG data." },
     fullPage: { type: "boolean", description: "For screenshot actions without uid, capture the entire rendered page instead of the viewport." },
-    verbose: { type: "boolean", description: "For screenshot actions, include low-signal accessibility nodes." },
-    maxNodes: { type: "integer", minimum: 1, maximum: 2000, description: "For screenshot actions, maximum semantic snapshot nodes. Defaults to 500." },
-    name: { type: "string", description: "Optional screenshot name used in cua_batch results." }
+    verbose: { type: "boolean", description: "For snapshot actions, include low-signal accessibility nodes." },
+    maxNodes: { type: "integer", minimum: 1, maximum: 2000, description: "For snapshot actions, maximum semantic snapshot nodes. Defaults to 500." },
+    name: { type: "string", description: "Optional screenshot name used in CUA action results." }
   },
   required: ["type"]
+};
+
+const WAIT_FOR_SCHEMA = {
+  ...CUA_ACTION_SCHEMA,
+  description: "Element or network-idle condition. The workflow supplies type=wait_for automatically.",
+  required: []
+};
+
+const WORKFLOW_STEP_SCHEMA = {
+  description: "One workflow step. Use do for any CUA action, waitFor for a condition, if for a conditional branch, or while for a bounded loop.",
+  oneOf: [
+    { type: "object", properties: { do: CUA_ACTION_SCHEMA }, required: ["do"] },
+    { type: "object", properties: { waitFor: WAIT_FOR_SCHEMA }, required: ["waitFor"] },
+    {
+      type: "object",
+      properties: {
+        if: {
+          type: "object",
+          properties: {
+            when: WAIT_FOR_SCHEMA,
+            then: { type: "array", items: { $ref: "#/$defs/workflowStep" } },
+            else: { type: "array", items: { $ref: "#/$defs/workflowStep" } }
+          },
+          required: ["when"]
+        }
+      },
+      required: ["if"]
+    },
+    {
+      type: "object",
+      properties: {
+        while: {
+          type: "object",
+          properties: {
+            when: WAIT_FOR_SCHEMA,
+            maxIterations: { type: "integer", minimum: 1, maximum: MAX_WORKFLOW_LOOP_ITERATIONS },
+            steps: { type: "array", items: { $ref: "#/$defs/workflowStep" } }
+          },
+          required: ["when", "maxIterations", "steps"]
+        }
+      },
+      required: ["while"]
+    }
+  ]
 };
 
 const TOOLS = [
   {
     name: "tab_open",
-    description: "Open a URL in a new Chrome tab, attach the debugger immediately, and return its tab ID for subsequent debugging tools.",
+    description: "Open a URL in a new Chrome tab, attach the debugger immediately, and return its tab ID for subsequent debugging tools. When the task ends and these tabs are no longer needed, clean them up: call session_finish with the same ownerId to close every tab opened by the task, or use tab_close for an individual tab.",
     inputSchema: {
       type: "object",
       properties: {
         url: { type: "string", description: "HTTP or HTTPS URL to open." },
         active: { type: "boolean", description: "Whether to activate the new tab. Defaults to false." },
-        groupName: { type: "string", description: "Tab group title. Defaults to BrowserTrace MCP. Groups are scoped to the tab's window." }
+        groupName: { type: "string", description: "Tab group title. Defaults to BrowserTrace MCP. Groups are scoped to the tab's window." },
+        ownerId: { type: "string", description: "Stable task identifier. Supply this and call session_finish with the same ownerId to close every tab opened by the task." }
       },
       required: ["url"]
+    }
+  },
+  {
+    name: "session_finish",
+    description: "Finish one task: detach the debugger and close every tab opened by tab_open with that ownerId.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ownerId: { type: "string", description: "Required stable task identifier supplied to tab_open." }
+      },
+      required: ["ownerId"]
     }
   },
   {
@@ -113,24 +181,26 @@ const TOOLS = [
   },
   {
     name: "screenshot",
-    description: "Return a compact accessibility snapshot with stable element UIDs, upload a PNG to MCP Center temporary storage by default, and optionally include the PNG as MCP image content. With uid, scroll to and capture only that element and return its semantic subtree.",
+    description: "Capture a PNG only. output=file (default) saves and returns filePath; output=base64 returns inline PNG data. Use snapshot for accessibility text and UIDs.",
     inputSchema: {
       type: "object",
       properties: {
         tabId: { type: "integer", description: "Target tab ID. Defaults to the active tab." },
-        includeImage: { type: "boolean", description: "Include the PNG as MCP image content. Defaults to true. Set false to avoid returning base64; file saving is controlled separately." },
-        saveToFile: { type: "boolean", description: "Upload the PNG to MCP Center temporary storage and return its absolute filePath. Defaults to true." },
+        output: { type: "string", enum: ["file", "base64"], description: "Choose exactly one image output. Defaults to file." },
         name: { type: "string", description: "Screenshot name used to preserve a meaningful .png filename extension during upload." },
         uid: { type: "string", description: "Optional UID from a previous snapshot. Captures that element instead of the viewport." },
-        fullPage: { type: "boolean", description: "Capture the entire rendered page instead of the viewport. Ignored when uid is supplied." },
-        verbose: { type: "boolean", description: "Include ignored and otherwise low-signal accessibility nodes." },
-        maxNodes: { type: "integer", minimum: 1, maximum: 2000, description: "Maximum formatted snapshot nodes. Defaults to 500." }
+        fullPage: { type: "boolean", description: "Capture the entire rendered page instead of the viewport. Ignored when uid is supplied." }
       }
     }
   },
   {
+    name: "snapshot",
+    description: "Return a compact accessibility text snapshot with stable UIDs and portable locators; does not capture or return an image.",
+    inputSchema: { type: "object", properties: { tabId: { type: "integer" }, uid: { type: "string" }, verbose: { type: "boolean" }, maxNodes: { type: "integer", minimum: 1, maximum: 2000 } } }
+  },
+  {
     name: "cua_action",
-    description: "Perform one trusted human-like browser action. tabId is required and must be the ID returned by this MCP server's tab_open tool; do not use a user-existing tab or a tab ID obtained elsewhere. Supports move, hover, click, double_click, right_click, mouse_down, mouse_up, drag, scroll, type, key_press, key_down, key_up, select_all, clear, wait, and screenshot.",
+    description: "Perform one trusted human-like browser action. tabId is required and must be the ID returned by this MCP server's tab_open tool; do not use a user-existing tab or a tab ID obtained elsewhere. See action.description for per-type required targets and parameters. Supports move, hover, click, double_click, right_click, mouse_down, mouse_up, drag, scroll, type, key_press, key_down, key_up, select_all, clear, wait, wait_for, screenshot, and snapshot.",
     inputSchema: {
       type: "object",
       properties: {
@@ -141,69 +211,31 @@ const TOOLS = [
     }
   },
   {
-    name: "cua_batch",
-    description: "Perform up to 100 trusted browser actions sequentially in one MCP call. tabId is required and must be the ID returned by this MCP server's tab_open tool; do not use a user-existing tab or a tab ID obtained elsewhere. Use for stable forms and known coordinates; stop the batch before an unknown layout change that requires visual inspection.",
+    name: "workflow_run",
+    description: "Run a bounded browser workflow containing trusted CUA actions. Supports linear steps, declarative if and while control flow, and element or network-idle waits. Every loop requires maxIterations. Example search flow: {steps:[{do:{type:'screenshot',name:'search-before'}},{do:{type:'type',locator:{strategies:[{kind:'css',value:\"input[type='search']\"}]},text:\"search today's tech news\"}},{do:{type:'screenshot',name:'search-entered'}},{do:{type:'click',uid:'abc'}},{waitFor:{state:'network_idle',idleMs:500,timeoutMs:10000}},{do:{type:'screenshot',name:'search-results'}}]}. Screenshot steps return PNG/file paths; targeted actions return target coordinates and bounds, suitable for rendering a cursor walkthrough from the workflow result.",
     inputSchema: {
       type: "object",
       properties: {
         tabId: { type: "integer", description: "Required tab ID returned by this MCP server's tab_open tool." },
-        actions: { type: "array", items: CUA_ACTION_SCHEMA, minItems: 1, maxItems: 100, description: "Actions executed sequentially using the same schema as cua_action.action." },
-        stopOnError: { type: "boolean", description: "Stop at the first failed action. Defaults to true." },
-        defaultDelayMs: { type: "integer", minimum: 0, maximum: 10000 },
-        screenshotAfter: { type: "boolean" },
-        saveToFile: { type: "boolean", description: "When screenshotAfter is true, upload that final PNG and return filePathAfter. Defaults to true. Unavailable to cross-extension callers." }
+        workflow: {
+          type: "object",
+          description: "Workflow definition. Each step is do, waitFor, if, or while; do uses the same action type and parameters as cua_action.action.",
+          properties: {
+            version: { type: "integer" },
+            steps: { type: "array", minItems: 1, maxItems: MAX_WORKFLOW_STEPS, description: "Ordered workflow steps. Screenshot checkpoints are returned in the corresponding result steps.", items: { $ref: "#/$defs/workflowStep" } }
+          },
+          required: ["steps"]
+        },
+        stopOnError: { type: "boolean", description: "Stop at the first failed step. Defaults to true." }
       },
-      required: ["tabId", "actions"]
+      required: ["tabId", "workflow"],
+      $defs: { workflowStep: WORKFLOW_STEP_SCHEMA }
     }
   },
   {
-    name: "mouse_click",
-    description: "Send a trusted left mouse click through Chrome DevTools Protocol. An OPID is installed before the click so resulting fetch/XHR calls can be queried.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        tabId: { type: "integer" },
-        x: { type: "number", description: "Viewport CSS pixel X coordinate." },
-        y: { type: "number", description: "Viewport CSS pixel Y coordinate." },
-        opid: { type: "string", description: "Optional operation ID. Generated when omitted." },
-        label: { type: "string" }
-      },
-      required: ["x", "y"]
-    }
-  },
-  {
-    name: "type_text",
-    description: "Insert text into the currently focused control using Chrome DevTools Protocol.",
-    inputSchema: {
-      type: "object",
-      properties: { tabId: { type: "integer" }, text: { type: "string" } },
-      required: ["text"]
-    }
-  },
-  {
-    name: "key_press",
-    description: "Send a trusted keyboard press, such as Enter, Tab, Escape, ArrowDown, or Backspace.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        tabId: { type: "integer" },
-        key: { type: "string" },
-        code: { type: "string" },
-        modifiers: { type: "integer", description: "CDP modifier bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8." }
-      },
-      required: ["key"]
-    }
-  },
-  {
-    name: "scroll",
-    description: "Scroll at a viewport coordinate using a trusted mouse wheel event.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        tabId: { type: "integer" }, x: { type: "number" }, y: { type: "number" },
-        deltaX: { type: "number" }, deltaY: { type: "number" }
-      }
-    }
+    name: "macro_export",
+    description: "Export a portable macro configuration from a completed workflow_run runId. No browser state is saved; pass the returned macro.workflow to workflow_run to replay it. UID and coordinate-only targets are not exported; each action must have resolved a locator.",
+    inputSchema: { type: "object", properties: { runId: { type: "string" }, name: { type: "string" }, startUrl: { type: "string" } }, required: ["runId", "name"] }
   },
   {
     name: "evaluate_script",
@@ -236,67 +268,6 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: { tabId: { type: "integer" } }
-    }
-  },
-  {
-    name: "recording_start",
-    description: "Start the singleton continuous WebM recorder for an owner. If busy, a different owner is never preempted. The same owner may set replaceExisting=true to save and replace its previous recording. Recording stops and uploads automatically after maxDurationMs (5 minutes by default).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        tabId: { type: "integer", description: "Target tab ID. Defaults to the active tab." },
-        ownerId: { type: "string", description: "Required stable identifier for the agent/task that owns this recording. Reuse it across start, stop, and cancel calls." },
-        replaceExisting: { type: "boolean", description: "If true and the active recording has the same ownerId, stop and save it before starting this recording. Never replaces another owner's recording. Defaults to false." },
-        name: { type: "string", description: "Recording name used as the uploaded WebM filename hint." },
-        maxDurationMs: { type: "integer", minimum: 1000, maximum: 300000, description: "Maximum continuous recording duration. Defaults to and cannot exceed 300000ms (5 minutes)." },
-        saveToFile: { type: "boolean", description: "Upload the WebM when automatically stopped. Defaults to true." },
-        fps: { type: "integer", minimum: 5, maximum: 30, description: "Final Canvas/MediaRecorder frame rate. Defaults to 15." },
-        quality: { type: "integer", minimum: 20, maximum: 100, description: "CDP JPEG source-frame quality. Defaults to 90." },
-        maxWidth: { type: "integer", minimum: 320, maximum: 3840, description: "Maximum physical-pixel video width after applying devicePixelRatio. Defaults to 3840." },
-        maxHeight: { type: "integer", minimum: 240, maximum: 2160, description: "Maximum physical-pixel video height after applying devicePixelRatio. Defaults to 2160." },
-        videoBitsPerSecond: { type: "integer", minimum: 250000, maximum: 20000000, description: "WebM target bitrate. Defaults to 12000000." },
-        cursorMoveMs: { type: "integer", minimum: 0, maximum: 2000, description: "Fake cursor travel time before pointer actions. Defaults to 250ms." }
-      },
-      required: ["ownerId"]
-    }
-  },
-  {
-    name: "recording_status",
-    description: "Return the current continuous recording state, or the most recent automatically completed result.",
-    inputSchema: { type: "object", properties: {} }
-  },
-  {
-    name: "recording_stop",
-    description: "Finish an owned recording. recordingId and ownerId are required and must both match the active singleton recording.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        recordingId: { type: "string", description: "Required recording ID returned by recording_start." },
-        ownerId: { type: "string", description: "Required owner ID originally supplied to recording_start." },
-        saveToFile: { type: "boolean", description: "Upload the WebM to MCP Center temporary storage and return its absolute filePath. Defaults to true." },
-        finalHoldMs: { type: "integer", minimum: 0, maximum: 10000, description: "Capture the tab's current final state and hold it at the end of the video. Defaults to 2000ms; set 0 to disable." }
-      },
-      required: ["recordingId", "ownerId"]
-    }
-  },
-  {
-    name: "recording_cancel",
-    description: "Discard an owned recording without uploading. recordingId and ownerId must both match.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        recordingId: { type: "string", description: "Required recording ID returned by recording_start." },
-        ownerId: { type: "string", description: "Required owner ID originally supplied to recording_start." }
-      },
-      required: ["recordingId", "ownerId"]
-    }
-  },
-  {
-    name: "operation_create",
-    description: "Create an OPID that can be supplied to mouse_click and later used to query requests.",
-    inputSchema: {
-      type: "object",
-      properties: { label: { type: "string" } }
     }
   },
   {
@@ -358,6 +329,12 @@ const TOOLS = [
 
 function makeId(prefix) {
   return `${prefix}_${crypto.randomUUID()}`;
+}
+
+function safeText(value, maxLength = 65536) {
+  if (value == null) return "";
+  const text = String(value);
+  return text.length > maxLength ? `${text.slice(0, maxLength)}\n...[truncated]` : text;
 }
 
 function traceKey(tabId, documentId) {
@@ -473,6 +450,48 @@ async function queryTraceDocuments(tabId) {
     .map(([, value]) => value);
 }
 
+function matchingCdpRequest(traceRequest, networkRequests) {
+  const startedAt = Number(traceRequest.startedAt) || 0;
+  const method = String(traceRequest.method || "GET").toUpperCase();
+  const url = String(traceRequest.url || "");
+  const candidates = networkRequests
+    .filter((request) => String(request.url || request.responseUrl || "") === url
+      && String(request.method || "GET").toUpperCase() === method
+      && request.completed)
+    .map((request) => ({ request, deltaMs: Math.abs((Number(request.startedAt) || 0) - startedAt) }))
+    .sort((a, b) => a.deltaMs - b.deltaMs);
+  const best = candidates[0];
+  return best && best.deltaMs <= 5000 ? best : null;
+}
+
+async function enrichTraceResponseFromCdp(tabId, traceRequest, networkRequests) {
+  const match = matchingCdpRequest(traceRequest, networkRequests);
+  if (!match) return traceRequest;
+  try {
+    const body = await cdp(tabId, "Network.getResponseBody", { requestId: match.request.requestId });
+    if (body?.base64Encoded) return {
+      ...traceRequest,
+      cdpRequestId: match.request.requestId,
+      cdpBodyUnavailable: "CDP returned a binary response body",
+      cdpMatchDeltaMs: match.deltaMs
+    };
+    return {
+      ...traceRequest,
+      responseBody: safeText(body?.body || ""),
+      responseBodySource: "cdp-decoded",
+      cdpRequestId: match.request.requestId,
+      cdpMatchDeltaMs: match.deltaMs
+    };
+  } catch (error) {
+    return {
+      ...traceRequest,
+      cdpRequestId: match.request.requestId,
+      cdpBodyUnavailable: String(error?.message || error),
+      cdpMatchDeltaMs: match.deltaMs
+    };
+  }
+}
+
 function withoutBodies(request) {
   const { requestBody, responseBody, ...summary } = request;
   return {
@@ -535,6 +554,16 @@ async function closeTabs(tabIds) {
   await chrome.tabs.remove(ids);
   await Promise.all(ids.map((tabId) => removeDebuggerDataForTab(tabId)));
   return ids;
+}
+
+async function finishSession(ownerId) {
+  const normalizedOwnerId = String(ownerId || "").trim();
+  if (!normalizedOwnerId) throw new Error("ownerId is required");
+  const tabIds = [...managedTabOwnerIds]
+    .filter(([, tabOwnerId]) => tabOwnerId === normalizedOwnerId)
+    .map(([tabId]) => tabId);
+  const closedTabIds = await closeTabs(tabIds);
+  return { success: true, ownerId: normalizedOwnerId, closed: closedTabIds.length, closedTabIds };
 }
 
 async function ensureDebugger(tabId) {
@@ -913,6 +942,33 @@ function snapshotLimit(value) {
   return Math.max(1, Math.min(2000, Math.floor(Number(value) || DEFAULT_SNAPSHOT_MAX_NODES)));
 }
 
+function cssString(value) { return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"'); }
+
+async function locatorForBackendNode(tabId, backendNodeId) {
+  try {
+    const described = await cdp(tabId, "DOM.describeNode", { backendNodeId, depth: 0 });
+    const node = described?.node;
+    const attrs = new Map();
+    for (let i = 0; i < (node?.attributes?.length || 0); i += 2) attrs.set(node.attributes[i], node.attributes[i + 1]);
+    const tag = String(node?.localName || "").toLowerCase();
+    if (!tag) return undefined;
+    const stable = ["data-testid", "data-test", "data-cy", "data-qa", "data-test-id"];
+    for (const name of stable) {
+      const value = attrs.get(name);
+      if (value && value.length <= 120) return { strategies: [{ kind: "css", value: `[${name}="${cssString(value)}"]` }] };
+    }
+    const id = attrs.get("id");
+    if (id && id.length <= 64 && !/[a-f0-9]{8,}/i.test(id) && !/--|:/.test(id)) return { strategies: [{ kind: "css", value: `[id="${cssString(id)}"]` }] };
+    const name = attrs.get("name");
+    if (name && name.length <= 120) return { strategies: [{ kind: "css", value: `${tag}[name="${cssString(name)}"]` }] };
+    const aria = attrs.get("aria-label");
+    if (aria && aria.length <= 120) return { strategies: [{ kind: "css", value: `${tag}[aria-label="${cssString(aria)}"]` }] };
+  } catch {
+    // Some AX nodes are not presently describable DOM nodes; UID remains usable.
+  }
+  return undefined;
+}
+
 async function createAccessibilitySnapshot(tabId, options = {}) {
   await ensureTabRenderer(tabId);
   const debuggerAttached = await ensureDebugger(tabId);
@@ -960,6 +1016,7 @@ async function createAccessibilitySnapshot(tabId, options = {}) {
   }
 
   const lines = [];
+  const emitted = [];
   let included = 0;
   let truncated = false;
   const maxNodes = snapshotLimit(options.maxNodes);
@@ -983,12 +1040,18 @@ async function createAccessibilitySnapshot(tabId, options = {}) {
       if (value != null && String(value) !== String(name || "")) details.push(`value=${quoteSnapshotText(value)}`);
       if (uid) details.push(`uid=${uid}`);
       for (const [property, propertyValue] of Object.entries(properties)) details.push(`${property}=${JSON.stringify(propertyValue)}`);
-      lines.push(`${"  ".repeat(Math.min(depth, 30))}${details.join(" ")}`);
+      emitted.push({ prefix: "  ".repeat(Math.min(depth, 30)), details, backendNodeId });
       included++;
     }
     for (const childId of node.childIds || []) visit(nodeById.get(childId), childDepth);
   };
   visit(target, 0);
+  const locators = await Promise.all(emitted.map((item) => Number.isInteger(item.backendNodeId) ? locatorForBackendNode(tabId, item.backendNodeId) : undefined));
+  for (let index = 0; index < emitted.length; index++) {
+    const locator = locators[index];
+    if (locator) emitted[index].details.push(`locator=${JSON.stringify(locator)}`);
+    lines.push(`${emitted[index].prefix}${emitted[index].details.join(" ")}`);
+  }
   if (truncated) lines.push(`...[truncated after ${maxNodes} nodes]`);
 
   return {
@@ -1024,7 +1087,109 @@ async function getUidBounds(tabId, uid, options = {}) {
   const model = await cdp(tabId, "DOM.getBoxModel", { backendNodeId });
   const bounds = quadBounds(model?.model?.border || model?.model?.content);
   if (!(bounds.width > 0 && bounds.height > 0)) throw new Error(`Element uid ${uid} has an empty box`);
-  return { backendNodeId, bounds, snapshot };
+  return { backendNodeId, bounds, snapshot, locator: await locatorForBackendNode(tabId, backendNodeId) };
+}
+
+function normalizeLocator(locator) {
+  if (!locator || typeof locator !== "object" || !Array.isArray(locator.strategies)) return null;
+  const strategies = locator.strategies.map((item) => ({
+    kind: String(item?.kind || "").toLowerCase(), value: String(item?.value || "").trim()
+  })).filter((item) => (item.kind === "css" || item.kind === "xpath") && item.value);
+  if (!strategies.length) throw new Error("locator.strategies must contain a CSS or XPath selector");
+  const nth = locator.nth == null ? undefined : Math.max(0, Math.floor(Number(locator.nth)));
+  if (locator.nth != null && !Number.isFinite(nth)) throw new Error("locator.nth must be a non-negative integer");
+  return { strategies, nth, fingerprint: locator.fingerprint && typeof locator.fingerprint === "object" ? locator.fingerprint : undefined };
+}
+
+async function resolveLocator(tabId, rawLocator, { requireVisible = true } = {}) {
+  const locator = normalizeLocator(rawLocator);
+  if (!locator) throw new Error("locator is required");
+  const expression = `(${function (locator, requireVisible) {
+    const visible = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden" && Number(s.opacity) !== 0; };
+    for (const strategy of locator.strategies) {
+      let matches;
+      try {
+        if (strategy.kind === "css") matches = Array.from(document.querySelectorAll(strategy.value));
+        else {
+          const result = document.evaluate(strategy.value, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+          matches = Array.from({ length: result.snapshotLength }, (_, i) => result.snapshotItem(i)).filter((node) => node?.nodeType === Node.ELEMENT_NODE);
+        }
+      } catch { continue; }
+      if (requireVisible) matches = matches.filter(visible);
+      const index = locator.nth;
+      if (index != null) { if (matches[index]) { const el = matches[index]; const r = el.getBoundingClientRect(); return { ok: true, strategy, matchCount: matches.length, bounds: { x:r.x,y:r.y,width:r.width,height:r.height }, tagName: el.tagName.toLowerCase(), role: el.getAttribute("role") || undefined, name: el.getAttribute("aria-label") || el.innerText?.trim().slice(0, 120) || undefined }; } }
+      else if (matches.length === 1) { const el = matches[0]; const r = el.getBoundingClientRect(); return { ok: true, strategy, matchCount: 1, bounds: { x:r.x,y:r.y,width:r.width,height:r.height }, tagName: el.tagName.toLowerCase(), role: el.getAttribute("role") || undefined, name: el.getAttribute("aria-label") || el.innerText?.trim().slice(0, 120) || undefined }; }
+    }
+    return { ok: false };
+  }})(${JSON.stringify(locator)}, ${requireVisible ? "true" : "false"})`;
+  const result = await cdp(tabId, "Runtime.evaluate", { expression, returnByValue: true });
+  if (result.exceptionDetails) throw new Error(result.exceptionDetails.text || "Failed to resolve locator");
+  const value = result.result?.value;
+  if (!value?.ok) throw new Error("No unique matching element for locator");
+  return { ...value, locator };
+}
+
+async function waitForAction(tabId, action) {
+  const state = String(action.state || "visible");
+  const timeoutMs = Math.max(100, Math.min(60000, Number(action.timeoutMs) || DEFAULT_ELEMENT_WAIT_MS));
+  const deadline = Date.now() + timeoutMs;
+  if (action.condition === "url") {
+    const pattern = String(action.pattern || action.url || "");
+    while (Date.now() <= deadline) {
+      const tab = await chrome.tabs.get(tabId); const current = String(tab.url || "");
+      let matches = current === pattern || current.includes(pattern);
+      if (!matches) { try { matches = new RegExp(pattern).test(current); } catch { matches = false; } }
+      if (matches) return { condition: "url", pattern, currentUrl: current };
+      await delay(75);
+    }
+    throw new Error(`Timed out waiting for URL ${pattern}`);
+  }
+  if (state === "network_idle") {
+    const idleMs = Math.max(50, Math.min(10000, Number(action.idleMs) || DEFAULT_NETWORK_IDLE_MS));
+    let idleSince = 0;
+    while (Date.now() <= deadline) {
+      const requests = await queryNetworkRequests(tabId);
+      const inflight = requests.filter((request) => !request.completed && !request.failed && request.resourceType !== "WebSocket" && request.resourceType !== "EventSource");
+      if (!inflight.length) { idleSince ||= Date.now(); if (Date.now() - idleSince >= idleMs) return { state, idleMs, inflight: 0 }; }
+      else idleSince = 0;
+      await delay(50);
+    }
+    throw new Error(`Timed out waiting for network idle after ${timeoutMs}ms`);
+  }
+  if (!action.locator && !action.uid) throw new Error("wait_for element state requires locator or uid");
+  while (Date.now() <= deadline) {
+    try {
+      if (action.uid) { await getUidBounds(tabId, String(action.uid)); if (state === "present" || state === "visible") return { state, resolvedBy: "uid", uid: String(action.uid) }; }
+      else { const found = await resolveLocator(tabId, action.locator, { requireVisible: state !== "present" && state !== "absent" && state !== "hidden" }); if (state === "present" || state === "visible") return { state, resolvedBy: "locator", locator: found.locator, usedStrategy: found.strategy }; }
+    } catch (error) {
+      if (state === "absent" || state === "hidden") return { state, resolvedBy: action.uid ? "uid" : "locator" };
+    }
+    await delay(75);
+  }
+  throw new Error(`Timed out waiting for ${state} after ${timeoutMs}ms`);
+}
+
+async function pointAtCoordinates(tabId, x, y) {
+  const target = { x, y };
+  try {
+    const resolved = await cdp(tabId, "DOM.getNodeForLocation", {
+      x,
+      y,
+      includeUserAgentShadowDOM: true
+    });
+    const backendNodeId = Number(resolved?.backendNodeId);
+    if (!Number.isInteger(backendNodeId)) return target;
+    target.locator = await locatorForBackendNode(tabId, backendNodeId);
+    try {
+      const model = await cdp(tabId, "DOM.getBoxModel", { backendNodeId });
+      target.bounds = quadBounds(model?.model?.border || model?.model?.content);
+    } catch {
+      // A valid hit node may be text-only, detached, or without a visible box.
+    }
+  } catch {
+    // Keep coordinate input usable when Chrome cannot resolve a hit node.
+  }
+  return target;
 }
 
 async function pointForAction(tabId, action, prefix = "") {
@@ -1037,10 +1202,70 @@ async function pointForAction(tabId, action, prefix = "") {
       x: resolved.bounds.x + resolved.bounds.width / 2,
       y: resolved.bounds.y + resolved.bounds.height / 2,
       uid: String(action[uidKey]),
+      locator: resolved.locator,
       bounds: resolved.bounds
     };
   }
-  return { x: coordinate(action[xKey], xKey), y: coordinate(action[yKey], yKey) };
+  if (!prefix && action.locator) {
+    const resolved = await resolveLocator(tabId, action.locator);
+    return { x: resolved.bounds.x + resolved.bounds.width / 2, y: resolved.bounds.y + resolved.bounds.height / 2, locator: resolved.locator, usedStrategy: resolved.strategy, bounds: resolved.bounds };
+  }
+  return pointAtCoordinates(tabId, coordinate(action[xKey], xKey), coordinate(action[yKey], yKey));
+}
+
+function rememberWorkflowRun(run) {
+  workflowRuns.set(run.runId, run);
+  while (workflowRuns.size > MAX_WORKFLOW_RUNS) workflowRuns.delete(workflowRuns.keys().next().value);
+}
+
+function portableAction(step) {
+  const action = step?.action || step?.requestedAction;
+  const target = step?.target;
+  const portableTypes = new Set(["click", "double_click", "right_click", "scroll", "type", "key_press", "key_down", "key_up", "select_all", "clear", "wait", "wait_for"]);
+  if (!action || !portableTypes.has(action.type) || ["move", "hover", "mouse_down", "mouse_up"].includes(action.type)) return null;
+  const out = { ...action };
+  delete out.uid; delete out.x; delete out.y; delete out.fromUid; delete out.toUid; delete out.fromX; delete out.fromY; delete out.toX; delete out.toY; delete out.opid;
+  delete out.locator; delete out.target;
+  if (target?.locator) out.target = target.locator;
+  if (["click", "double_click", "right_click", "type", "key_press", "key_down", "key_up", "clear", "select_all", "scroll"].includes(out.type) && !out.target && out.type !== "key_press" && out.type !== "key_down" && out.type !== "key_up") return null;
+  return out;
+}
+
+async function runWorkflow(tab, workflow, stopOnError = true) {
+  const root = workflow && typeof workflow === "object" ? workflow : {};
+  if (!Array.isArray(root.steps) || !root.steps.length) throw new Error("workflow.steps must be a non-empty array");
+  const trace = [];
+  let executed = 0;
+  const runSteps = async (steps, path = []) => {
+    for (let index = 0; index < steps.length; index++) {
+      if (++executed > MAX_WORKFLOW_STEPS) throw new Error(`Workflow exceeds ${MAX_WORKFLOW_STEPS} executed steps`);
+      const step = steps[index] || {}; const stepPath = [...path, index];
+      try {
+        if (step.do) { const action = { ...step.do, locator: step.do.locator || step.do.target }; delete action.target;
+          if (action.type === "navigate") { const url = String(action.url || ""); if (!url) throw new Error("navigate requires url"); await chrome.tabs.update(tab.id, { url }); trace.push({ path: stepPath, action, type: "navigate", success: true }); continue; }
+          const result = await executeCuaAction(tab, action); trace.push({ path: stepPath, action, ...result }); continue; }
+        if (step.waitFor) { const action = { type: "wait_for", ...step.waitFor, locator: step.waitFor.locator || step.waitFor.target }; delete action.target; const result = await executeCuaAction(tab, action); trace.push({ path: stepPath, action, ...result }); continue; }
+        if (step.if) {
+          const condition = { type: "wait_for", ...(step.if.when || {}), timeoutMs: Math.min(500, Number(step.if.when?.timeoutMs) || 200) };
+          let matches = true; try { await waitForAction(tab.id, condition); } catch { matches = false; }
+          trace.push({ path: stepPath, type: "if", success: true, matched: matches });
+          await runSteps(matches ? (step.if.then || []) : (step.if.else || []), [...stepPath, matches ? "then" : "else"]); continue;
+        }
+        if (step.while) {
+          const max = Math.max(1, Math.min(MAX_WORKFLOW_LOOP_ITERATIONS, Number(step.while.maxIterations) || 0));
+          if (!max) throw new Error("while.maxIterations is required");
+          let count = 0;
+          while (count < max) { let matches = true; try { await waitForAction(tab.id, { type: "wait_for", ...(step.while.when || {}), timeoutMs: Math.min(500, Number(step.while.when?.timeoutMs) || 200) }); } catch { matches = false; }
+            if (!matches) break; await runSteps(step.while.steps || [], [...stepPath, "while", count++]); }
+          trace.push({ path: stepPath, type: "while", success: true, iterations: count }); continue;
+        }
+        throw new Error("Workflow step needs do, waitFor, if, or while");
+      } catch (error) { trace.push({ path: stepPath, success: false, error: error?.message || String(error) }); if (stopOnError) throw error; }
+    }
+  };
+  await runSteps(root.steps);
+  const run = { runId: makeId("run"), tabId: tab.id, workflow: root, steps: trace, createdAt: Date.now() };
+  rememberWorkflowRun(run); return { success: trace.every((step) => step.success), ...run };
 }
 
 async function installOperation(tabId, opid, label) {
@@ -1162,35 +1387,19 @@ async function executeCuaAction(tab, rawAction = {}) {
     recordingBurstStarted = await beginRecordingBurst(tab, type, { ...action, opid });
     if (type === "wait") {
       await delay(waitDuration(action.durationMs, 250));
+    } else if (type === "wait_for") {
+      target = await waitForAction(tab.id, action);
+    } else if (type === "snapshot") {
+      const semantic = await createAccessibilitySnapshot(tab.id, action);
+      snapshot = semantic.text;
+      if (action.uid) target = { uid: String(action.uid) };
     } else if (type === "screenshot") {
-      const includeImage = action.includeImage !== false;
-      const saveToFile = action.saveToFile !== false;
-      if (action.uid) {
-        if (!includeImage && !saveToFile) {
-          const semantic = await createAccessibilitySnapshot(tab.id, action);
-          snapshot = semantic.text;
-          target = { uid: String(action.uid) };
-        } else {
-          const captured = await captureUid(tab, String(action.uid), action);
-          await appendRecordingCheckpoint(tab.id, captured.image);
-          if (includeImage) image = captured.image;
-          if (saveToFile) filePath = (await saveScreenshot(captured.image, {
-            tabId: tab.id, name: action.name
-          })).filePath;
-          snapshot = captured.snapshot.text;
-          target = { uid: String(action.uid), bounds: captured.bounds };
-        }
-      } else {
-        snapshot = (await createAccessibilitySnapshot(tab.id, action)).text;
-        if (includeImage || saveToFile) {
-          const captured = await captureTab(tab, action);
-          await appendRecordingCheckpoint(tab.id, captured);
-          if (includeImage) image = captured;
-          if (saveToFile) filePath = (await saveScreenshot(captured, {
-            tabId: tab.id, name: action.name
-          })).filePath;
-        }
-      }
+      const output = String(action.output || "file");
+      if (output !== "file" && output !== "base64") throw new Error("screenshot output must be file or base64");
+      const captured = action.uid ? await captureUid(tab, String(action.uid), action) : { image: await captureTab(tab, action) };
+      if (action.uid) target = { uid: String(action.uid), bounds: captured.bounds };
+      if (output === "base64") image = captured.image;
+      else filePath = (await saveScreenshot(captured.image, { tabId: tab.id, name: action.name })).filePath;
     } else if (type === "move" || type === "hover") {
       target = await pointForAction(tab.id, action);
       const { x, y } = target;
@@ -1243,9 +1452,7 @@ async function executeCuaAction(tab, rawAction = {}) {
       await recordingMarkClick(tab.id);
       await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: toX, y: toY, button: "left", clickCount: 1 });
     } else if (type === "scroll") {
-      target = action.uid ? await pointForAction(tab.id, action) : {
-        x: coordinate(action.x, "x", 0), y: coordinate(action.y, "y", 0)
-      };
+      target = await pointForAction(tab.id, action);
       await recordingMoveCursor(tab.id, target);
       await cdp(tab.id, "Input.dispatchMouseEvent", {
         type: "mouseWheel", x: target.x, y: target.y,
@@ -1257,6 +1464,12 @@ async function executeCuaAction(tab, rawAction = {}) {
         await recordingMoveCursor(tab.id, target);
         await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", x: target.x, y: target.y, button: "left", clickCount: 1 });
         await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: target.x, y: target.y, button: "left", clickCount: 1 });
+        if (action.append !== true) {
+          await dispatchKey(tab.id, { key: "Control+A" }, "keyDown");
+          await dispatchKey(tab.id, { key: "Control+A" }, "keyUp");
+          await dispatchKey(tab.id, { key: "Backspace" }, "keyDown");
+          await dispatchKey(tab.id, { key: "Backspace" }, "keyUp");
+        }
       }
       await cdp(tab.id, "Input.insertText", { text: String(action.text ?? "") });
       await recordingMarkKey(tab.id, String(action.text ?? "").slice(0, 24) || "Text input");
@@ -1388,12 +1601,16 @@ async function executeTool(name, args = {}, context = {}) {
       if (url.protocol !== "http:" && url.protocol !== "https:") {
         throw new Error("url must use http:// or https://");
       }
-      const tab = await chrome.tabs.create({ url: url.href, active: args.active === true });
+      // Create a blank tab first so it is managed before the requested URL
+      // starts navigating (and before its top-level frame is committed).
+      const tab = await chrome.tabs.create({ url: "about:blank", active: args.active === true });
       managedTabIds.add(tab.id);
+      const ownerId = String(args.ownerId || "").trim();
+      if (ownerId) managedTabOwnerIds.set(tab.id, ownerId);
       await chrome.tabs.update(tab.id, { autoDiscardable: false });
+      await chrome.tabs.update(tab.id, { url: url.href });
       const group = await addTabToGroup(tab, args.groupName);
       await ensureDebugger(tab.id);
-      await ensureRecordingOverlay(tab.id).catch(() => {});
       return {
         success: true,
         tabId: tab.id,
@@ -1401,6 +1618,7 @@ async function executeTool(name, args = {}, context = {}) {
         active: tab.active,
         autoDiscardable: false,
         group,
+        ownerId: ownerId || undefined,
         url: tab.url || tab.pendingUrl || url.href
       };
     }
@@ -1424,53 +1642,31 @@ async function executeTool(name, args = {}, context = {}) {
       await closeTabs([tab.id]);
       return { success: true, tabId: tab.id };
     }
+    case "session_finish":
+      return finishSession(args.ownerId);
     case "screenshot": {
       const tab = await resolveTab(args.tabId);
-      const includeImage = args.includeImage !== false;
-      const saveToFile = allowFileSave && args.saveToFile !== false;
-      if (args.uid) {
-        if (includeImage || saveToFile) {
-          const captured = await captureUid(tab, String(args.uid), args);
-          await appendRecordingCheckpoint(tab.id, captured.image);
-          const filePath = saveToFile ? (await saveScreenshot(captured.image, {
-            tabId: tab.id, name: args.name
-          })).filePath : undefined;
-          return {
-            image: includeImage ? captured.image : undefined,
-            filePath,
-            tabId: tab.id,
-            uid: String(args.uid),
-            bounds: captured.bounds,
-            snapshot: {
-              text: captured.snapshot.text,
-              nodeCount: captured.snapshot.nodeCount,
-              truncated: captured.snapshot.truncated
-            }
-          };
-        }
-        const snapshot = await createAccessibilitySnapshot(tab.id, args);
-        return {
-          tabId: tab.id,
-          uid: String(args.uid),
-          snapshot: { text: snapshot.text, nodeCount: snapshot.nodeCount, truncated: snapshot.truncated }
-        };
-      }
-      const snapshot = await createAccessibilitySnapshot(tab.id, args);
-      const captured = includeImage || saveToFile ? await captureTab(tab, args) : undefined;
-      if (captured) await appendRecordingCheckpoint(tab.id, captured);
+      const output = String(args.output || "file");
+      if (output !== "file" && output !== "base64") throw new Error("screenshot output must be file or base64");
+      if (output === "file" && !allowFileSave) throw new Error("screenshot output=file is unavailable to cross-extension callers; use output=base64");
+      const captured = args.uid ? await captureUid(tab, String(args.uid), args) : { image: await captureTab(tab, args) };
       return {
-        image: includeImage ? captured : undefined,
-        filePath: saveToFile ? (await saveScreenshot(captured, {
-          tabId: tab.id, name: args.name
-        })).filePath : undefined,
         tabId: tab.id,
-        snapshot: { text: snapshot.text, nodeCount: snapshot.nodeCount, truncated: snapshot.truncated }
+        uid: args.uid ? String(args.uid) : undefined,
+        bounds: captured.bounds,
+        image: output === "base64" ? captured.image : undefined,
+        filePath: output === "file" ? (await saveScreenshot(captured.image, { tabId: tab.id, name: args.name })).filePath : undefined
       };
+    }
+    case "snapshot": {
+      const tab = await resolveTab(args.tabId);
+      const snapshot = await createAccessibilitySnapshot(tab.id, args);
+      return { tabId: tab.id, uid: args.uid ? String(args.uid) : undefined, snapshot: { text: snapshot.text, nodeCount: snapshot.nodeCount, truncated: snapshot.truncated } };
     }
     case "cua_action": {
       if (!Number.isInteger(args.tabId)) throw new Error("cua_action requires the tabId returned by tab_open");
       const tab = await resolveTab(args.tabId);
-      const action = allowFileSave ? args.action : { ...args.action, saveToFile: false };
+      const action = args.action;
       const result = await executeCuaAction(tab, action);
       const { image, snapshot, ...step } = result;
       return {
@@ -1481,54 +1677,23 @@ async function executeTool(name, args = {}, context = {}) {
         images: image ? [{ name: String(action?.name || "screenshot"), ...image }] : []
       };
     }
-    case "cua_batch": {
-      if (!Number.isInteger(args.tabId)) throw new Error("cua_batch requires the tabId returned by tab_open");
-      const tab = await resolveTab(args.tabId);
-      const actions = Array.isArray(args.actions)
-        ? args.actions.slice(0, MAX_BATCH_ACTIONS).map((action) => allowFileSave ? action : { ...action, saveToFile: false })
-        : [];
-      if (!actions.length) throw new Error("actions must be a non-empty array");
-      if (args.actions.length > MAX_BATCH_ACTIONS) throw new Error(`actions cannot exceed ${MAX_BATCH_ACTIONS} items`);
-      await ensureDebugger(tab.id);
-      const startedAt = Date.now();
-      const steps = [];
-      const images = [];
-      const stopOnError = args.stopOnError !== false;
-      const defaultDelayMs = waitDuration(args.defaultDelayMs);
-
-      for (let index = 0; index < actions.length; index++) {
-        const action = actions[index];
-        try {
-          const step = await executeCuaAction(tab, action);
-          if (step.image) images.push({ name: String(action.name || `step-${index}`), ...step.image });
-          const { image: _image, ...summary } = step;
-          steps.push({ index, ...summary });
-        } catch (error) {
-          steps.push({ index, type: String(action?.type || ""), success: false, error: error?.message || String(error) });
-          if (stopOnError) break;
-        }
-        if (defaultDelayMs && index < actions.length - 1) await delay(defaultDelayMs);
-      }
-
-      let filePathAfter;
-      if (args.screenshotAfter) {
-        const captured = await captureTab(tab);
-        await appendRecordingCheckpoint(tab.id, captured);
-        images.push({ name: "after", ...captured });
-        if (allowFileSave && args.saveToFile !== false) {
-          filePathAfter = (await saveScreenshot(captured, { tabId: tab.id, name: "after" })).filePath;
-        }
-      }
-      return {
-        success: steps.length === actions.length && steps.every((step) => step.success),
-        tabId: tab.id,
-        requested: actions.length,
-        completed: steps.filter((step) => step.success).length,
-        steps,
-        durationMs: Date.now() - startedAt,
-        images,
-        filePathAfter
-      };
+    case "workflow_run": {
+      if (!Number.isInteger(args.tabId)) throw new Error("workflow_run requires the tabId returned by tab_open");
+      return runWorkflow(await resolveTab(args.tabId), args.workflow, args.stopOnError !== false);
+    }
+    case "macro_export": {
+      const run = workflowRuns.get(String(args.runId || ""));
+      if (!run) throw new Error("Unknown or expired runId; save the macro immediately after execution");
+      const actions = run.steps.map(portableAction).filter(Boolean);
+      if (!actions.length) throw new Error("Run contains no exportable actions with portable locators");
+      const rejected = run.steps.filter((step) => step.action && !portableAction(step));
+      if (rejected.length) throw new Error(`Cannot export ${rejected.length} action(s): use locator or UID with a stable snapshot locator, not coordinates`);
+      const startUrl = String(args.startUrl || "");
+      let origin = ""; try { origin = startUrl ? new URL(startUrl).origin : ""; } catch { /* leave empty */ }
+      const trustedInput = actions.some((action) => !["click", "type", "key_press", "scroll", "wait", "wait_for"].includes(action.type));
+      const macro = { kind: "browser-macro", schemaVersion: 1, id: makeId("macro"), name: String(args.name).trim(), startUrl, origin, createdAt: Date.now(), updatedAt: Date.now(), requirements: { trustedInput }, workflow: { version: 1, steps: actions.map((action) => ({ do: action })) } };
+      if (!macro.name) throw new Error("name is required");
+      return { success: true, macro };
     }
     case "mouse_click": {
       const tab = await resolveTab(args.tabId);
@@ -1748,26 +1913,31 @@ async function executeTool(name, args = {}, context = {}) {
       recording = null;
       return { success: true, recordingId: cancelledId, cancelled: true };
     }
-    case "operation_create":
-      return { opid: makeId("op"), label: String(args.label || ""), createdAt: Date.now() };
     case "operation_get_requests": {
       const opid = String(args.opid || "");
       const documents = await queryTraceDocuments(args.tabId);
-      const requests = documents.flatMap((document) => Object.values(document.requests || {})
+      const rawRequests = documents.flatMap((document) => Object.values(document.requests || {})
         .filter((request) => request.opid === opid)
         .map((request) => ({
-          ...(args.includeBodies ? request : withoutBodies(request)),
+          ...request,
           tabId: document.tabId,
           documentId: document.documentId,
           pageUrl: document.pageUrl
         })));
+      const networkByTab = new Map();
+      const requests = await Promise.all(rawRequests.map(async (request) => {
+        if (!args.includeBodies) return withoutBodies(request);
+        if (!networkByTab.has(request.tabId)) networkByTab.set(request.tabId, queryNetworkRequests(request.tabId));
+        await ensureDebugger(request.tabId);
+        return enrichTraceResponseFromCdp(request.tabId, request, await networkByTab.get(request.tabId));
+      }));
       requests.sort((a, b) => Number(a.startedAt) - Number(b.startedAt));
       return {
         opid,
         count: requests.length,
         requests,
-        correlation: "best-effort-zone-style",
-        warning: "OPID propagation can be lost across native, navigation, service-worker, or unusual asynchronous chains. Zero matches do not prove that no HTTP request occurred; use network_list_requests to inspect CDP Network traffic for the same tab and time window."
+        correlation: "best-effort-zone-style with CDP response-body enrichment",
+        warning: "OPID propagation can be lost across native, navigation, service-worker, or unusual asynchronous chains. CDP response-body enrichment matches URL, method, and start time within five seconds; inspect cdpMatchDeltaMs when concurrent identical requests exist. Zero matches do not prove that no HTTP request occurred; use network_list_requests to inspect CDP Network traffic for the same tab and time window."
       };
     }
     case "network_list_requests": {
@@ -1876,7 +2046,7 @@ function toolsForTransport(transport) {
   };
   for (const tool of tools) {
     markFileSavingUnavailable(tool.inputSchema);
-    if (["screenshot", "cua_action", "cua_batch", "recording_start", "recording_stop"].includes(tool.name)) {
+    if (["screenshot", "cua_action", "recording_start", "recording_stop"].includes(tool.name)) {
       tool.description += " Cross-extension calls return inline data where applicable and never upload files.";
     }
   }
@@ -2060,6 +2230,7 @@ chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage());
 chrome.tabs.onRemoved.addListener((tabId) => {
   attachedTabs.delete(tabId);
   managedTabIds.delete(tabId);
+  managedTabOwnerIds.delete(tabId);
   void removeDebuggerDataForTab(tabId);
 });
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
@@ -2067,6 +2238,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "complete" && managedTabIds.has(tabId)) {
     void ensureDebugger(tabId).then(() => ensureRecordingOverlay(tabId)).catch(() => {});
   }
+});
+chrome.webNavigation.onCommitted.addListener((details) => {
+  if (!managedTabIds.has(details.tabId)) return;
+  void injectTraceRuntime(details.tabId, details.frameId).catch(() => {
+    // Chrome refuses injection into a small set of restricted frame URLs.
+  });
 });
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (!source.tabId) return;
@@ -2163,8 +2340,17 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   const entry = consoleEntryFromEvent(method, params);
   if (entry) void appendConsoleEntry(source.tabId, entry);
 });
-chrome.debugger.onDetach.addListener((source) => {
-  if (source.tabId) attachedTabs.delete(source.tabId);
+chrome.debugger.onDetach.addListener((source, reason) => {
+  if (!source.tabId) return;
+  attachedTabs.delete(source.tabId);
+  // A user cancelling Chrome's "being debugged" prompt is an explicit request
+  // to release this tab. Keep the tab open, but do not let a later navigation
+  // complete event silently attach the debugger again.
+  if (reason === "canceled_by_user") {
+    managedTabIds.delete(source.tabId);
+    managedTabOwnerIds.delete(source.tabId);
+    void removeDebuggerDataForTab(source.tabId);
+  }
 });
 
 void connect();

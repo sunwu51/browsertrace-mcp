@@ -69,8 +69,8 @@ Both transports support `initialize`, `tools/list`, `tools/call`, and `ping`.
 Direct extension calls can receive inline MCP image content, snapshots, and
 normal JSON results, but cannot upload screenshots or recordings to MCP Center.
 `saveToFile` is forced to `false` for direct calls even if the caller supplies
-`true`; this applies to screenshots, CUA screenshot actions, batch final
-screenshots, and recording start/stop. A stopped direct-call recording therefore
+`true`; this applies to screenshots, CUA screenshot actions, and recording
+start/stop. A stopped direct-call recording therefore
 does not return a video file. Restrict `externally_connectable.ids` to known
 extension IDs if the local Chrome profile contains untrusted extensions.
 
@@ -89,8 +89,8 @@ extension IDs if the local Chrome profile contains untrusted extensions.
    when checking native form submissions or navigation.
 7. Call `request_get_details` for bodies and complete page-tracer request details.
 
-`mouse_click` accepts a caller-provided OPID, so an agent may also call
-`operation_create` first and use that value for the click.
+Every input CUA action generates an OPID when omitted. Supply `opid` directly
+on the action only when a caller needs a stable custom identifier.
 
 `tab_open` defaults to `active: false`, sets `autoDiscardable: false`, and puts
 created tabs in the `BrowserTrace MCP` tab group. Supply `groupName` to use a
@@ -107,7 +107,9 @@ and snapshot operations restore it with a background reload first.
 `screenshot` always returns a compact accessibility tree. It is not a complete
 HTML DOM dump: it focuses on semantic content such as buttons, links, inputs,
 headings, menus, and element state. Nodes that resolve to DOM elements have
-stable UIDs for the lifetime of that document.
+stable UIDs for the lifetime of that document. When a stable DOM attribute is
+available, the line also includes a portable `locator` with ordered CSS/XPath
+strategies; use that locator for a macro rather than the document-local UID.
 
 Screenshots are uploaded to MCP Center temporary storage by default, and the MCP
 result returns `filePath` as an absolute filename on the MCP Center machine.
@@ -130,8 +132,7 @@ The upload URL is derived from the configured WebSocket URL, for example
 `multipart/form-data` in the `file` field; videos are not converted to Base64.
 Set both `includeImage: false` and
 `saveToFile: false` for a semantic-only snapshot with no PNG capture. UID and
-CUA screenshot actions use the same behavior; `cua_batch.screenshotAfter` is
-also uploaded automatically.
+CUA screenshot actions use the same behavior.
 
 Example snapshot output:
 
@@ -161,12 +162,26 @@ navigation or when a framework replaces the node. Capture a new snapshot after
 an invalid-UID error. Canvas contents and DOM nodes excluded from the
 accessibility tree still require coordinate CUA.
 
-## Human-like actions and batches
+## Human-like actions
 
 `cua_action` accepts one action object. Supported action types are `move`,
 `hover`, `click`, `double_click`, `right_click`, `mouse_down`, `mouse_up`,
 `drag`, `scroll`, `type`, `key_press`, `key_down`, `key_up`, `select_all`,
-`clear`, `wait`, and `screenshot`.
+`clear`, `wait`, `wait_for`, and `screenshot`.
+
+Action parameters vary by `type`:
+
+| Action | Required parameters | Optional target / notes |
+| --- | --- | --- |
+| `click`, `double_click`, `right_click`, `move`, `hover`, `mouse_down`, `mouse_up` | `uid` or `locator`, or both `x` and `y` | Coordinates are the visual fallback. |
+| `drag` | `fromUid` and `toUid`, or `fromX`, `fromY`, `toX`, and `toY` | `steps` and `durationMs` control interpolation. |
+| `type` | `text` | Supply `uid` or `locator` to focus that control first; otherwise text goes to the currently focused control. |
+| `key_press`, `key_down`, `key_up` | `key` | Supply `uid` or `locator` to focus that control first. |
+| `select_all`, `clear` | None | Supply `uid` or `locator` to focus that control first; otherwise they use the current focus. |
+| `scroll` | `deltaX` and/or `deltaY` | `uid` / `locator` or `x` / `y` optionally chooses the wheel position. |
+| `wait` | None | `durationMs` defaults to 250 ms. |
+| `wait_for` | `state` | Element states require `uid` or `locator`; `network_idle` requires neither. |
+| `screenshot` | None | `uid` captures that element; otherwise it captures the viewport or `fullPage`. |
 
 Mouse actions accept `uid` instead of `x`/`y`. `drag` accepts `fromUid` and
 `toUid` instead of coordinate pairs. Text and keyboard actions may also include
@@ -180,28 +195,84 @@ available as a visual fallback:
 }
 ```
 
-Use `cua_batch` when coordinates are known and intermediate actions do not
-change the layout in an unknown way:
+Portable locators can be passed instead of a UID. Strategies are tried in
+order and must resolve to exactly one visible element (or specify `nth`):
 
 ```json
 {
   "tabId": 123,
-  "defaultDelayMs": 50,
-  "screenshotAfter": true,
-  "actions": [
-    { "type": "click", "x": 300, "y": 220 },
-    { "type": "clear" },
-    { "type": "type", "text": "sunwu" },
-    { "type": "click", "x": 300, "y": 280 },
-    { "type": "type", "text": "test@example.com" }
-  ]
+  "action": {
+    "type": "click",
+    "locator": { "strategies": [{ "kind": "css", "value": "[data-testid='sign-in']" }] }
+  }
 }
 ```
 
-For a hover menu whose item coordinates are not known yet, call a batch with
-`hover`, `wait`, and `screenshot`; inspect the returned image, then issue the
-next click or batch. A model cannot inspect a screenshot halfway through one
-tool call and dynamically change later coordinates in that same batch.
+Use `wait_for` rather than fixed sleeps when a later step depends on page
+state. It supports `present`, `visible`, `hidden`, `absent`, and CDP-backed
+`network_idle` (WebSocket and EventSource are ignored):
+
+```json
+{ "tabId": 123, "action": { "type": "wait_for", "state": "visible", "locator": { "strategies": [{ "kind": "css", "value": ".results" }] }, "timeoutMs": 10000 } }
+```
+
+## Workflows and macros
+
+Use `workflow_run` for every multi-step operation, including a simple linear
+sequence. It also supports bounded control flow: a step is `{ "do": <CUA
+action> }`, `{ "waitFor": <wait_for
+fields> }`, `{ "if": { "when": ..., "then": [...], "else": [...] } }`, or
+`{ "while": { "when": ..., "maxIterations": 20, "steps": [...] } }`.
+Conditions use the same element-state or `network_idle` fields as `wait_for`.
+
+```json
+{ "tabId": 123, "workflow": { "steps": [
+  { "do": { "type": "click", "x": 300, "y": 220 } },
+  { "do": { "type": "type", "text": "sunwu" } },
+  { "do": { "type": "key_press", "key": "Enter" } }
+] } }
+```
+
+### Search workflow with visual checkpoints
+
+Capture the state before and after entering a search, click a previously
+observed button UID, wait for the resulting requests to settle, and capture the
+final result:
+
+```json
+{
+  "tabId": 123,
+  "workflow": {
+    "steps": [
+      { "do": { "type": "screenshot", "output": "file", "name": "search-before" } },
+      {
+        "do": {
+          "type": "type",
+          "locator": { "strategies": [{ "kind": "css", "value": "input[type='search']" }] },
+          "text": "search today's tech news"
+        }
+      },
+      { "do": { "type": "screenshot", "output": "file", "name": "search-entered" } },
+      { "do": { "type": "click", "uid": "abc" } },
+      { "waitFor": { "state": "network_idle", "idleMs": 500, "timeoutMs": 10000 } },
+      { "do": { "type": "screenshot", "output": "file", "name": "search-results" } }
+    ]
+  }
+}
+```
+
+Each screenshot step returns exactly one image output: `output: "file"` returns
+`steps[].filePath`, while `output: "base64"` returns `steps[].image`. Use
+`snapshot` when only accessibility text/UIDs are needed. Targeted actions return `steps[].target`, including the actual
+click point and, for UID or locator targets, the element bounds. A Remotion or
+HyperFrames composition can use the checkpoint images plus this per-step target
+data to animate cursor movement/clicks and produce an operation walkthrough.
+
+Every completed workflow returns a short-lived `runId`. Call
+`macro_export` with that ID to return a portable, versioned macro configuration. Export only
+uses the locator captured while the action ran: UIDs, OPIDs, and coordinates
+are deliberately omitted. It does not save browser state; pass the returned
+`macro.workflow` directly to `workflow_run` to replay it later.
 
 ## Script, console, and tab tools
 
@@ -217,6 +288,18 @@ tool call and dynamically change later coordinates in that same batch.
 ```json
 { "groupName": "BrowserTrace MCP" }
 ```
+
+For task-scoped cleanup, supply a stable `ownerId` to every `tab_open` call,
+then call `session_finish` with the same ID. It stops that owner's recording,
+detaches the debugger, and closes every tab the task opened:
+
+```json
+{ "ownerId": "agent-task-abc" }
+```
+
+For a form field addressed by `uid`, `type` replaces the field's current value
+by default (including browser-prefilled credentials). Set `append: true` only
+when text should be appended deliberately.
 
 ## Continuous WebM recording
 

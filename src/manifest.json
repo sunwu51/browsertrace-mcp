@@ -13,29 +13,15 @@
     "activeTab",
     "alarms",
     "debugger",
-    "offscreen",
+    "scripting",
     "storage",
     "tabGroups",
     "tabs",
-    "unlimitedStorage"
+    "unlimitedStorage",
+    "webNavigation"
   ],
   "host_permissions": [
     "<all_urls>"
-  ],
-  "content_scripts": [
-    {
-      "matches": ["http://*/*", "https://*/*"],
-      "js": ["trace-runtime.js"],
-      "run_at": "document_start",
-      "world": "MAIN",
-      "all_frames": true
-    },
-    {
-      "matches": ["http://*/*", "https://*/*"],
-      "js": ["content-bridge.js"],
-      "run_at": "document_start",
-      "all_frames": true
-    }
   ],
   "options_page": "options.html",
   "action": {
