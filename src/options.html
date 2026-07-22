@@ -12,11 +12,14 @@
       <label class="toggle"><input id="enabled" type="checkbox"> 启用 MCP Center WebSocket Bridge（Chrome MCP SDK）</label>
       <label for="wsUrl">MCP Center WebSocket URL</label>
       <input id="wsUrl" type="url" spellcheck="false" placeholder="ws://localhost:3000/ws/browsertrace">
+      <label for="urlAllowlist">允许 tab_open 打开的 URL</label>
+      <textarea id="urlAllowlist" rows="6" spellcheck="false" placeholder="https://example.com/*"></textarea>
+      <p class="hint">每行一个通配符规则，* 匹配任意字符。留空将禁止打开所有 URL。</p>
       <div class="actions">
         <button id="save" type="button">保存并重连</button>
         <span id="status" aria-live="polite"></span>
       </div>
-      <p>加载或更新扩展后，请刷新需要调试的页面，以便在页面代码之前安装 OPID tracer。</p>
+      <p class="note">加载或更新扩展后，请刷新需要调试的页面，以便在页面代码之前安装 OPID tracer。</p>
     </main>
     <script src="options.js"></script>
   </body>

@@ -31,13 +31,18 @@ label:not(.toggle) {
   align-items: center;
 }
 
-input[type="url"] {
+input[type="url"],
+textarea {
   box-sizing: border-box;
   width: 100%;
   padding: 10px 12px;
   border: 1px solid ButtonBorder;
   border-radius: 4px;
   font: inherit;
+}
+
+textarea {
+  resize: vertical;
 }
 
 .actions {
@@ -59,8 +64,14 @@ button {
   color: #087f5b;
 }
 
-p {
+.note {
   margin-top: 28px;
   color: GrayText;
   line-height: 1.6;
+}
+
+.hint {
+  margin: 6px 0 0;
+  color: GrayText;
+  font-size: 13px;
 }

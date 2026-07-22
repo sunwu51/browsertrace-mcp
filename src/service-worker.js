@@ -1,10 +1,12 @@
 /* global chrome */
 
 import { createChromeMcpServer, createMcpCenterFileStore } from "@sunwu51/chrome-mcp-sdk";
+import { DEFAULT_URL_ALLOWLIST, isUrlAllowed, normalizeUrlAllowlist } from "./url-allowlist.js";
 
 const DEFAULT_SETTINGS = {
   wsUrl: "ws://localhost:3000/ws/browsertrace",
-  enabled: true
+  enabled: true,
+  urlAllowlist: DEFAULT_URL_ALLOWLIST
 };
 const LEGACY_DEFAULT_WS_URL = "ws://localhost:3000/ws/chrome-debugger";
 const TRACE_PREFIX = "trace:";
@@ -1572,6 +1574,11 @@ async function executeTool(name, args = {}, context = {}) {
       if (url.protocol !== "http:" && url.protocol !== "https:") {
         throw new Error("url must use http:// or https://");
       }
+      const stored = await chrome.storage.local.get({ urlAllowlist: DEFAULT_URL_ALLOWLIST });
+      const urlAllowlist = normalizeUrlAllowlist(stored.urlAllowlist);
+      if (!isUrlAllowed(url.href, urlAllowlist)) {
+        throw new Error(`URL is not allowed by the configured whitelist: ${url.href}; current whitelist: ${JSON.stringify(urlAllowlist)}`);
+      }
       // Create a blank tab first so it is managed before the requested URL
       // starts navigating (and before its top-level frame is committed).
       const tab = await chrome.tabs.create({ url: "about:blank", active: args.active === true });
@@ -1590,6 +1597,7 @@ async function executeTool(name, args = {}, context = {}) {
         autoDiscardable: false,
         group,
         ownerId: ownerId || undefined,
+        urlAllowlist,
         url: tab.url || tab.pendingUrl || url.href
       };
     }
