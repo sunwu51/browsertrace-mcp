@@ -21,3 +21,9 @@ test("built extension exposes workflow-based CUA without compatibility or record
   assert.match(worker, /async function captureWithoutVirtualCursor/);
   assert.match(worker, /async function pointAtCoordinates[\s\S]*DOM\.getNodeForLocation[\s\S]*locatorForBackendNode/);
 });
+
+test("options page shows disabled bridge state without reconnecting status", async () => {
+  const options = await readFile(join(root, "dist", "options.js"), "utf8");
+  assert.match(options, /settings\.enabled === true \? \(connected \? "已连接" : "未连接"\) : "已停用"/);
+  assert.match(options, /bridgeEnabled \? "正在重连" : "已停用"/);
+});

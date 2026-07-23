@@ -15,8 +15,9 @@ async function render() {
   enabled.checked = settings.enabled === true;
   wsUrl.value = settings.wsUrl;
   urlAllowlist.value = Array.isArray(settings.urlAllowlist) ? settings.urlAllowlist.join("\n") : defaults.urlAllowlist.join("\n");
-  status.textContent = settings.bridgeStatus?.connected ? "已连接" : "未连接";
-  status.dataset.connected = String(settings.bridgeStatus?.connected === true);
+  const connected = settings.enabled === true && settings.bridgeStatus?.connected === true;
+  status.textContent = settings.enabled === true ? (connected ? "已连接" : "未连接") : "已停用";
+  status.dataset.connected = String(connected);
 }
 
 document.querySelector("#save").addEventListener("click", async () => {
@@ -26,9 +27,11 @@ document.querySelector("#save").addEventListener("click", async () => {
     return;
   }
   const allowlist = urlAllowlist.value.split(/\r?\n/).map((pattern) => pattern.trim()).filter(Boolean);
-  await chrome.storage.local.set({ enabled: enabled.checked, wsUrl: url, urlAllowlist: allowlist });
+  const bridgeEnabled = enabled.checked;
+  await chrome.storage.local.set({ enabled: bridgeEnabled, wsUrl: url, urlAllowlist: allowlist });
   await chrome.runtime.sendMessage({ type: "bridge-reconnect" });
-  status.textContent = "正在重连";
+  status.textContent = bridgeEnabled ? "正在重连" : "已停用";
+  status.dataset.connected = "false";
   setTimeout(render, 800);
 });
 
